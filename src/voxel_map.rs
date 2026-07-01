@@ -1,6 +1,6 @@
 use std::collections::{HashSet, VecDeque};
 
-use nalgebra::{Point3, Vector3};
+use nalgebra::{Matrix3, Point3, Vector3};
 // use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashMap;
 
@@ -40,6 +40,10 @@ pub struct VoxelCell {
     pub mean: Point3<f32>,
 
     pub voxel_key: VoxelKey,
+
+    /// 共分散行列（compute_covariances() 呼び出し後に有効）。
+    pub covariance: Matrix3<f32>,
+    pub covariance_valid: bool,
 }
 
 pub struct FrameEntry {
@@ -88,6 +92,8 @@ impl VoxelCell {
                 iz: 0,
             },
             is_point: true,
+            covariance: Matrix3::identity(),
+            covariance_valid: false,
         }
     }
 
@@ -102,6 +108,8 @@ impl VoxelCell {
             mean: center,
             voxel_key: *key,
             is_point: true,
+            covariance: Matrix3::identity(),
+            covariance_valid: false,
         }
     }
 
@@ -125,21 +133,74 @@ impl VoxelCell {
 pub fn build_voxel_map(
     points: &[Point3<f32>],
     voxel_size: f32,
-    // max_points_per_voxel: usize,
+    neighbor_range: i32,
+    is_target: bool,
 ) -> VoxelMap {
     let mut voxel_map = VoxelMap::new();
 
     for p in points {
         let key = voxel_key(p, voxel_size);
-
-        let _cell = voxel_map
+        voxel_map
             .entry(key)
             .or_insert_with(|| VoxelCell::from_key(&key, voxel_size, *p, 0));
+    }
 
-        // if cell.is_point {
-        //     continue;
-        // }
+    if is_target {
+        compute_covariances(&mut voxel_map, 5, neighbor_range);
     }
 
     voxel_map
+}
+
+/// ボクセルマップ内の各セルの共分散行列を計算する。
+/// 対象セル + 周囲 `neighbor_range` ボクセルの代表点（各1点）を使用する。
+/// 合計点数が `min_points` 未満のセルは `covariance_valid = false` のまま。
+/// target 点群の VoxelMap に対してのみ呼び出す。
+pub fn compute_covariances(voxel_map: &mut VoxelMap, min_points: usize, neighbor_range: i32) {
+    let keys: Vec<VoxelKey> = voxel_map.keys().cloned().collect();
+
+    for key in keys {
+        // 近傍セルの代表点を1点ずつ収集（イミュータブル参照はここで完結）
+        let mut all_points: Vec<Point3<f32>> = Vec::new();
+        for dz in -neighbor_range..=neighbor_range {
+            for dy in -neighbor_range..=neighbor_range {
+                for dx in -neighbor_range..=neighbor_range {
+                    let nkey = VoxelKey {
+                        ix: key.ix + dx,
+                        iy: key.iy + dy,
+                        iz: key.iz + dz,
+                    };
+                    if let Some(nc) = voxel_map.get(&nkey) {
+                        if nc.is_point {
+                            all_points.push(nc.point.0);
+                        }
+                    }
+                }
+            }
+        }
+
+        let cell = voxel_map.get_mut(&key).unwrap();
+
+        let n = all_points.len();
+        if n < min_points {
+            cell.covariance_valid = false;
+            continue;
+        }
+
+        // 近傍込みの平均で mean を更新
+        let mean_vec =
+            all_points.iter().fold(Vector3::zeros(), |acc, p| acc + p.coords) / n as f32;
+        cell.mean = Point3::from(mean_vec);
+
+        // 不偏共分散行列
+        let mut cov = Matrix3::zeros();
+        for p in &all_points {
+            let d = p.coords - mean_vec;
+            cov += d * d.transpose();
+        }
+        cov /= (n - 1) as f32;
+
+        cell.covariance = cov;
+        cell.covariance_valid = true;
+    }
 }

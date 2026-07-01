@@ -26,12 +26,15 @@ const IMU_TO_LIDAR_QUAT_W: f64 = 0.00097028;
 
 const DOWNSAMPLE_VOXEL_SIZE: f32 = 0.2; // m
 
+const NEIGHBOR_RANGE: i32 = 2; // Voxel search range for nearest neighbor search
+
 const KNN_K: usize = 5; // Number of nearest neighbors for plane fitting
 const SEARCH_RANGE: i32 = 2; // Voxel search range for nearest neighbor search
 const MAX_DIST_FACTOR: f32 = 3.0; // Maximum distance factor for nearest neighbor search
 const PLANE_FIT_THRESHOLD: f32 = 0.1; // Threshold for plane fitting
+const MAX_POINTS_PER_VOXEL: usize = 8; // Max points collected per voxel (for covariance)
 
-const GICP_ITERATIONS: usize = 5; // Default: 5
+const ICP_ITERATIONS: usize = 5; // Default: 5
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
@@ -147,12 +150,26 @@ fn main() -> Result<()> {
         // --- Downsample target points ---
 
         // --- Build voxel map for source points ---
-        let source_voxel_map = build_voxel_map(&downsampled_source_points, DOWNSAMPLE_VOXEL_SIZE);
+        let source_voxel_map = build_voxel_map(
+            &downsampled_source_points,
+            DOWNSAMPLE_VOXEL_SIZE,
+            NEIGHBOR_RANGE,
+            false,
+        );
         // --- Build voxel map for source points ---
 
         // --- Build voxel map for target points ---
-        let target_voxel_map = build_voxel_map(&downsampled_target_points, DOWNSAMPLE_VOXEL_SIZE);
+        let target_voxel_map = build_voxel_map(
+            &downsampled_target_points,
+            DOWNSAMPLE_VOXEL_SIZE,
+            NEIGHBOR_RANGE,
+            true,
+        );
         // --- Build voxel map for target points ---
+
+        for i in 0..ICP_ITERATIONS {
+            if i == 0 {}
+        }
 
         // --- Pick up valid source points by checking if they are close enough to the target plane ---
         let valid_source_points = pickup_valid_source_points(
