@@ -1,6 +1,6 @@
 use nalgebra::{Matrix3, Point3, Vector3};
 
-use crate::voxel_map::{VoxelCell, VoxelKey, VoxelMap, voxel_key};
+use crate::voxel_map::{voxel_key, VoxelCell, VoxelKey, VoxelMap};
 
 // ---------------------------------------------------------------------------
 // 平面フィッティング
@@ -62,6 +62,22 @@ pub fn check_source_on_plane(normal: &Vector3<f32>, d: f32, source_point: &Point
     s > 0.9
 }
 
+// ---------------------------------------------------------------------------
+// 対応点
+// ---------------------------------------------------------------------------
+
+/// Point-to-Plane ICP で使う1対応点。
+/// - `src_point`: source の実点座標
+/// - `target_cell`: k近傍中の**最近傍**セル（対応点）
+/// - `plane_normal` / `plane_d`: k近傍 mean から求めた平面
+pub struct PointCorrespondence<'a> {
+    pub src_key: VoxelKey,
+    pub src_point: Point3<f32>,
+    pub target_cell: &'a VoxelCell,
+    pub plane_normal: Vector3<f32>,
+    pub plane_d: f32,
+}
+
 /// query_point に近い順に最大 `k` 個の target_map セルを返す。
 /// 返り値: Vec<(&VoxelCell, f32)> — (セル参照, 距離の二乗)
 fn find_k_nearest_target_voxels<'a>(
@@ -106,13 +122,13 @@ fn find_k_nearest_target_voxels<'a>(
 }
 
 /// source_map の各点について target_map から k 近傍セルを探し、
-/// 以下の条件をすべて満たす場合のみ結果に含める:
+/// 以下の条件をすべて満たす場合のみ対応点として返す:
 ///   1. 近傍点がちょうど k 個見つかった
 ///   2. k 番目（最遠）の距離が `voxel_size * max_dist_factor` 以内
 ///   3. k 点が平面を形成できる (`plane_fit_threshold`)
 ///   4. source 点がその平面に十分近い (Fast-LIO2 基準 s > 0.9)
 ///
-/// `max_dist_factor`: 2.0〜4.0 を推奨。
+/// 返り値の `target_cell` は k 近傍中の**最近傍**セル（ICP 対応点）。
 pub fn pickup_valid_source_points<'a>(
     source_map: &VoxelMap,
     target_map: &'a VoxelMap,
@@ -121,14 +137,16 @@ pub fn pickup_valid_source_points<'a>(
     k: usize,
     max_dist_factor: f32,
     plane_fit_threshold: f32,
-) -> Vec<(VoxelKey, Vec<(&'a VoxelCell, f32)>)> {
+) -> Vec<PointCorrespondence<'a>> {
     let max_neighbor_dist_sq = (voxel_size * max_dist_factor).powi(2);
 
     source_map
         .iter()
         .filter_map(|(src_key, src_cell)| {
+            let src_point = src_cell.point.0;
+
             let neighbors = find_k_nearest_target_voxels(
-                &src_cell.mean,
+                &src_point,
                 target_map,
                 voxel_size,
                 search_range,
@@ -147,7 +165,8 @@ pub fn pickup_valid_source_points<'a>(
             }
 
             // 条件3 & 4: 平面フィッティング
-            let neighbor_points: Vec<Point3<f32>> = neighbors.iter().map(|(c, _)| c.mean).collect();
+            let neighbor_points: Vec<Point3<f32>> =
+                neighbors.iter().map(|(c, _)| c.mean).collect();
 
             let (normal, d) = fit_plane(&neighbor_points)?;
 
@@ -155,11 +174,18 @@ pub fn pickup_valid_source_points<'a>(
                 return None;
             }
 
-            if !check_source_on_plane(&normal, d, &src_cell.mean) {
+            if !check_source_on_plane(&normal, d, &src_point) {
                 return None;
             }
 
-            Some((*src_key, neighbors))
+            // neighbors はソート済み → [0] が最近傍対応点
+            Some(PointCorrespondence {
+                src_key: *src_key,
+                src_point,
+                target_cell: neighbors[0].0,
+                plane_normal: normal,
+                plane_d: d,
+            })
         })
         .collect()
 }

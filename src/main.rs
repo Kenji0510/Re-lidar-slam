@@ -172,7 +172,7 @@ fn main() -> Result<()> {
         }
 
         // --- Pick up valid source points by checking if they are close enough to the target plane ---
-        let valid_source_points = pickup_valid_source_points(
+        let valid_correspondence_points = pickup_valid_source_points(
             &source_voxel_map,
             &target_voxel_map,
             DOWNSAMPLE_VOXEL_SIZE,
