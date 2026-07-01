@@ -164,6 +164,7 @@ fn main() -> Result<()> {
             MAX_DIST_FACTOR,     // max_dist_factor
             PLANE_FIT_THRESHOLD, // plane_fit_threshold
         );
+        // --- Pick up valid source points by checking if they are close enough to the target plane ---
     }
 
     Ok(())
