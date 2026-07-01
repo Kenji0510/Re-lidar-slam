@@ -3,9 +3,10 @@ use nalgebra::{Matrix4, Point3, Quaternion, UnitQuaternion, Vector3};
 use re_lidar_slam::{
     deskew_points::deskew_points,
     file_handler::{load_imu_data, load_pcd_files, load_pcd_xyzit},
+    find_nearest_points::pickup_valid_source_points,
     predict_pose_by_imu::{align_imu_timestamps, build_rotation_trajectory, predict_pose_by_imu},
     types::{CurrentFrameInfo, SLAMMap},
-    voxel_map::{LOCALMap, LocalMapConfig},
+    voxel_map::{LOCALMap, LocalMapConfig, build_voxel_map},
     voxelization::voxel_downsample_points,
 };
 
@@ -15,9 +16,6 @@ const SAVE_DIR: &str = "data/output/06212026/debug";
 const MIN_DIST: f32 = 0.1;
 const MAX_DIST: f32 = 40.0;
 
-const DOWNSAMPLE_VOXEL_SIZE: f32 = 0.2; // m
-const GICP_ITERATIONS: usize = 5; // Default: 5
-
 // IMU coordination to LiDAR coordination (Robosense 96 beam)
 // Quaternion (x, y, z, w): -0.705437, 0.708767, -0.00246579, 0.00097028
 // Translation (x, y, z)  : 0.00425, 0.00418, -0.00446  [m]
@@ -25,6 +23,15 @@ const IMU_TO_LIDAR_QUAT_X: f64 = -0.705437;
 const IMU_TO_LIDAR_QUAT_Y: f64 = 0.708767;
 const IMU_TO_LIDAR_QUAT_Z: f64 = -0.00246579;
 const IMU_TO_LIDAR_QUAT_W: f64 = 0.00097028;
+
+const DOWNSAMPLE_VOXEL_SIZE: f32 = 0.2; // m
+
+const KNN_K: usize = 5; // Number of nearest neighbors for plane fitting
+const SEARCH_RANGE: i32 = 2; // Voxel search range for nearest neighbor search
+const MAX_DIST_FACTOR: f32 = 3.0; // Maximum distance factor for nearest neighbor search
+const PLANE_FIT_THRESHOLD: f32 = 0.1; // Threshold for plane fitting
+
+const GICP_ITERATIONS: usize = 5; // Default: 5
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
@@ -138,6 +145,25 @@ fn main() -> Result<()> {
         let downsampled_target_points =
             voxel_downsample_points(&target_points, DOWNSAMPLE_VOXEL_SIZE);
         // --- Downsample target points ---
+
+        // --- Build voxel map for source points ---
+        let source_voxel_map = build_voxel_map(&downsampled_source_points, DOWNSAMPLE_VOXEL_SIZE);
+        // --- Build voxel map for source points ---
+
+        // --- Build voxel map for target points ---
+        let target_voxel_map = build_voxel_map(&downsampled_target_points, DOWNSAMPLE_VOXEL_SIZE);
+        // --- Build voxel map for target points ---
+
+        // --- Pick up valid source points by checking if they are close enough to the target plane ---
+        let valid_source_points = pickup_valid_source_points(
+            &source_voxel_map,
+            &target_voxel_map,
+            DOWNSAMPLE_VOXEL_SIZE,
+            SEARCH_RANGE,
+            KNN_K,               // k
+            MAX_DIST_FACTOR,     // max_dist_factor
+            PLANE_FIT_THRESHOLD, // plane_fit_threshold
+        );
     }
 
     Ok(())

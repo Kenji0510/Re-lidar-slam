@@ -69,11 +69,10 @@ fn find_k_nearest_target_voxels<'a>(
     target_map: &'a VoxelMap,
     voxel_size: f32,
     search_range: i32,
-    max_dist_sq: Option<f32>,
+    max_dist_sq: f32,
     k: usize,
 ) -> Vec<(&'a VoxelCell, f32)> {
     let base_key = voxel_key(query_point, voxel_size);
-    let dist_limit = max_dist_sq.unwrap_or(f32::INFINITY);
 
     // (dist_sq, cell) を収集してから距離順ソート
     let mut candidates: Vec<(&VoxelCell, f32)> = Vec::new();
@@ -94,7 +93,7 @@ fn find_k_nearest_target_voxels<'a>(
                 let diff = query_point.coords - target_cell.mean.coords;
                 let dist_sq = diff.dot(&diff);
 
-                if dist_sq < dist_limit {
+                if dist_sq < max_dist_sq {
                     candidates.push((target_cell, dist_sq));
                 }
             }
@@ -114,12 +113,11 @@ fn find_k_nearest_target_voxels<'a>(
 ///   4. source 点がその平面に十分近い (Fast-LIO2 基準 s > 0.9)
 ///
 /// `max_dist_factor`: 2.0〜4.0 を推奨。
-pub fn find_nearest_points<'a>(
+pub fn pickup_valid_source_points<'a>(
     source_map: &VoxelMap,
     target_map: &'a VoxelMap,
     voxel_size: f32,
     search_range: i32,
-    max_dist_sq: Option<f32>,
     k: usize,
     max_dist_factor: f32,
     plane_fit_threshold: f32,
@@ -134,7 +132,7 @@ pub fn find_nearest_points<'a>(
                 target_map,
                 voxel_size,
                 search_range,
-                max_dist_sq,
+                max_neighbor_dist_sq,
                 k,
             );
 
