@@ -38,6 +38,8 @@ const MAX_POINTS_PER_VOXEL: usize = 8; // Max points collected per voxel (for co
 const ICP_ITERATIONS: usize = 5; // Default: 5
 const ICP_RMSE_THRESHOLD: f32 = 1e-4; // 収束判定: RMSE の変化量がこれ以下なら停止
 
+const MAX_DIST_FOR_VOXEL_MAP: f32 = 40.0;
+
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
 
@@ -80,9 +82,9 @@ fn main() -> Result<()> {
         min_points_per_voxel: 3,
         min_observed_frames_per_voxel: 3,
         max_frames: 50,
-        max_distance: MAX_DIST,
+        max_distance: MAX_DIST_FOR_VOXEL_MAP,
     };
-    let slam_map = SLAMMap {
+    let mut slam_map = SLAMMap {
         global_voxel_map: LOCALMap::new(map_config),
         local_voxel_map: LOCALMap::new(map_config),
     };
@@ -218,6 +220,24 @@ fn main() -> Result<()> {
             prev_rmse = rmse;
         }
         // --- ICP (Point to Plane) ---
+
+        // --- Update current frame info ---
+        let r64 = r_mat.cast::<f64>();
+        let t64 = t_vec.cast::<f64>();
+        let mut new_global_pose = Matrix4::<f64>::identity();
+        new_global_pose.fixed_view_mut::<3, 3>(0, 0).copy_from(&r64);
+        new_global_pose.fixed_view_mut::<3, 1>(0, 3).copy_from(&t64);
+        current_frame_info.current_global_pose = new_global_pose;
+        current_frame_info.current_velocity = pose_prediction.1;
+        // --- Update current frame info ---
+
+        // --- Update the LocalMap with the new frame's points ---
+        slam_map.local_voxel_map.update_with_new_frame(
+            &downsampled_source_points,
+            &current_frame_info.current_global_pose,
+        );
+        // --- Update the LocalMap with the new frame's points ---
+        
     }
 
     Ok(())

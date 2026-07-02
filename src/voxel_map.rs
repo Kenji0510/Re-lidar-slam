@@ -1,6 +1,6 @@
 use std::collections::{HashSet, VecDeque};
 
-use nalgebra::{Matrix3, Point3, Vector3};
+use nalgebra::{Matrix3, Matrix4, Point3, Vector3};
 // use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashMap;
 
@@ -69,6 +69,56 @@ impl LOCALMap {
             config,
             next_frame_id: 0,
         }
+    }
+
+    /// ICP で位置合わせ済みの source 点群をローカルマップに追加する。
+    ///
+    /// - 新規ボクセル: そのまま挿入
+    /// - 既存ボクセル: ボクセル中心 (mean) に近い方の点を採用
+    /// - 追加後: max_distance 以上離れたボクセルを破棄
+    pub fn update_with_new_frame(
+        &mut self,
+        source_points: &[Point3<f32>],
+        global_pose: &Matrix4<f64>,
+    ) {
+        let pose_f32 = global_pose.cast::<f32>();
+        let r_mat: Matrix3<f32> = pose_f32.fixed_view::<3, 3>(0, 0).into();
+        let t_vec: Vector3<f32> = pose_f32.fixed_view::<3, 1>(0, 3).into();
+        let origin = Point3::from(t_vec);
+
+        let voxel_size = self.config.index_voxel_size;
+        let frame_id = self.next_frame_id;
+
+        // --- 点群を追加 ---
+        for p in source_points {
+            let p_world = Point3::from(r_mat * p.coords + t_vec);
+            let key = voxel_key(&p_world, voxel_size);
+
+            match self.voxel_map.entry(key) {
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(VoxelCell::from_key(&key, voxel_size, p_world, frame_id));
+                }
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    let cell = e.get_mut();
+                    // ボクセル中心 (mean) に近い点を採用
+                    let existing_dist_sq =
+                        (cell.point.0.coords - cell.mean.coords).norm_squared();
+                    let new_dist_sq = (p_world.coords - cell.mean.coords).norm_squared();
+                    if new_dist_sq < existing_dist_sq {
+                        cell.point = (p_world, frame_id);
+                    }
+                }
+            }
+        }
+
+        self.next_frame_id += 1;
+
+        // --- 自己位置から max_distance 以上のボクセルを破棄 ---
+        let max_dist_sq = self.config.max_distance * self.config.max_distance;
+        self.voxel_map.retain(|_, cell| {
+            let diff = cell.mean.coords - origin.coords;
+            diff.norm_squared() <= max_dist_sq
+        });
     }
 }
 
