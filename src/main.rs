@@ -237,13 +237,25 @@ fn main() -> Result<()> {
         // --- ICP (Point to Plane) ---
 
         // --- Update current frame info ---
+        let prev_pos = current_frame_info
+            .current_global_pose
+            .fixed_view::<3, 1>(0, 3)
+            .into_owned();
+
         let r64 = r_mat.cast::<f64>();
         let t64 = t_vec.cast::<f64>();
         let mut new_global_pose = Matrix4::<f64>::identity();
         new_global_pose.fixed_view_mut::<3, 3>(0, 0).copy_from(&r64);
         new_global_pose.fixed_view_mut::<3, 1>(0, 3).copy_from(&t64);
+
+        let new_pos = new_global_pose.fixed_view::<3, 1>(0, 3).into_owned();
+        let dt = (current_frame_start_time - prev_frame_start_time).max(1e-6);
+        let raw_velocity = (new_pos - prev_pos) / dt;
+        // 速度が異常に大きい場合（ICP 発散など）はクランプして安定化
+        let new_velocity = raw_velocity.cap_magnitude(2.0);
+
         current_frame_info.current_global_pose = new_global_pose;
-        current_frame_info.current_velocity = pose_prediction.1;
+        current_frame_info.current_velocity = new_velocity;
         // --- Update current frame info ---
 
         // --- Update the LocalMap with the new frame's points ---
