@@ -1,9 +1,10 @@
 use anyhow::Result;
-use nalgebra::{Matrix4, Point3, Quaternion, UnitQuaternion, Vector3};
+use nalgebra::{Matrix3, Matrix4, Point3, Quaternion, UnitQuaternion, Vector3};
 use re_lidar_slam::{
     deskew_points::deskew_points,
     file_handler::{load_imu_data, load_pcd_files, load_pcd_xyzit},
     find_nearest_points::pickup_valid_source_points,
+    icp::{apply_delta, build_point_to_plane_system, solve_icp_delta},
     predict_pose_by_imu::{align_imu_timestamps, build_rotation_trajectory, predict_pose_by_imu},
     types::{CurrentFrameInfo, SLAMMap},
     voxel_map::{LOCALMap, LocalMapConfig, build_voxel_map},
@@ -167,21 +168,45 @@ fn main() -> Result<()> {
         );
         // --- Build voxel map for target points ---
 
-        for i in 0..ICP_ITERATIONS {
-            if i == 0 {}
-        }
+        // --- ICP (Point to Plane) ---
+        // IMU 予測姿勢を初期値として (R, t) を取り出す
+        let pred_pose = pose_prediction.0.cast::<f32>();
+        let mut r_mat: Matrix3<f32> = pred_pose.fixed_view::<3, 3>(0, 0).into();
+        let mut t_vec: Vector3<f32> = pred_pose.fixed_view::<3, 1>(0, 3).into();
 
-        // --- Pick up valid source points by checking if they are close enough to the target plane ---
-        let valid_correspondence_points = pickup_valid_source_points(
-            &source_voxel_map,
-            &target_voxel_map,
-            DOWNSAMPLE_VOXEL_SIZE,
-            SEARCH_RANGE,
-            KNN_K,               // k
-            MAX_DIST_FACTOR,     // max_dist_factor
-            PLANE_FIT_THRESHOLD, // plane_fit_threshold
-        );
-        // --- Pick up valid source points by checking if they are close enough to the target plane ---
+        for _iter in 0..ICP_ITERATIONS {
+            // 対応点をピックアップ（現在の (R,t) で変換した src_point を基準に探索）
+            let correspondences = pickup_valid_source_points(
+                &source_voxel_map,
+                &target_voxel_map,
+                DOWNSAMPLE_VOXEL_SIZE,
+                SEARCH_RANGE,
+                KNN_K,
+                MAX_DIST_FACTOR,
+                PLANE_FIT_THRESHOLD,
+            );
+
+            // 線形システム構築
+            let system = build_point_to_plane_system(&correspondences, &r_mat, &t_vec);
+
+            log::debug!(
+                "ICP iter {_iter}: used={}, cost={:.4}",
+                system.used_count,
+                system.cost
+            );
+
+            // 解く → pose 更新
+            match solve_icp_delta(&system, 1e-6) {
+                Some(delta) => {
+                    (r_mat, t_vec) = apply_delta(&r_mat, &t_vec, &delta);
+                }
+                None => {
+                    log::warn!("ICP iter {_iter}: solve failed (too few correspondences)");
+                    break;
+                }
+            }
+        }
+        // --- ICP (Point to Plane) ---
     }
 
     Ok(())

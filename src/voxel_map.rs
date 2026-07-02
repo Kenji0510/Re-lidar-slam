@@ -188,8 +188,10 @@ pub fn compute_covariances(voxel_map: &mut VoxelMap, min_points: usize, neighbor
         }
 
         // 近傍込みの平均で mean を更新
-        let mean_vec =
-            all_points.iter().fold(Vector3::zeros(), |acc, p| acc + p.coords) / n as f32;
+        let mean_vec = all_points
+            .iter()
+            .fold(Vector3::zeros(), |acc, p| acc + p.coords)
+            / n as f32;
         cell.mean = Point3::from(mean_vec);
 
         // 不偏共分散行列

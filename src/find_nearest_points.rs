@@ -1,6 +1,6 @@
 use nalgebra::{Matrix3, Point3, Vector3};
 
-use crate::voxel_map::{voxel_key, VoxelCell, VoxelKey, VoxelMap};
+use crate::voxel_map::{VoxelCell, VoxelKey, VoxelMap, voxel_key};
 
 // ---------------------------------------------------------------------------
 // 平面フィッティング
@@ -165,8 +165,7 @@ pub fn pickup_valid_source_points<'a>(
             }
 
             // 条件3 & 4: 平面フィッティング
-            let neighbor_points: Vec<Point3<f32>> =
-                neighbors.iter().map(|(c, _)| c.mean).collect();
+            let neighbor_points: Vec<Point3<f32>> = neighbors.iter().map(|(c, _)| c.mean).collect();
 
             let (normal, d) = fit_plane(&neighbor_points)?;
 
