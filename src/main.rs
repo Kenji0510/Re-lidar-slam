@@ -25,7 +25,7 @@ const IMU_TO_LIDAR_QUAT_Y: f64 = 0.708767;
 const IMU_TO_LIDAR_QUAT_Z: f64 = -0.00246579;
 const IMU_TO_LIDAR_QUAT_W: f64 = 0.00097028;
 
-const DOWNSAMPLE_VOXEL_SIZE: f32 = 0.2; // m
+const DOWNSAMPLE_VOXEL_SIZE: f32 = 0.1; // m
 
 const NEIGHBOR_RANGE: i32 = 2; // Voxel search range for nearest neighbor search
 
@@ -36,7 +36,7 @@ const PLANE_FIT_THRESHOLD: f32 = 0.1; // Threshold for plane fitting
 const MAX_POINTS_PER_VOXEL: usize = 8; // Max points collected per voxel (for covariance)
 
 const ICP_ITERATIONS: usize = 5; // Default: 5
-const ICP_RMSE_THRESHOLD: f32 = 1e-4; // 収束判定: RMSE の変化量がこれ以下なら停止
+const ICP_RMSE_THRESHOLD: f32 = 0.07; // 収束判定: RMSE の変化量がこれ以下なら停止 // voxel size 0.2m の場合、0.07m くらいが妥当
 const ICP_RMSE_DIVERGE_THRESHOLD: f32 = 2.0; // 発散判定: RMSE がこれ以上なら結果棄却→IMU予測にフォールバック
 
 const MAX_DIST_FOR_VOXEL_MAP: f32 = 40.0;
@@ -78,7 +78,7 @@ fn main() -> Result<()> {
 
     // <--- Initialize SLAM map --->
     let map_config = LocalMapConfig {
-        index_voxel_size: 0.2,
+        index_voxel_size: DOWNSAMPLE_VOXEL_SIZE,
         max_points_per_voxel: 20,
         min_points_per_voxel: 3,
         min_observed_frames_per_voxel: 3,
@@ -288,7 +288,7 @@ fn main() -> Result<()> {
         })
         .collect();
 
-    let world_map_path = format!("{}/world_map.pcd", SAVE_DIR);
+    let world_map_path = format!("{}/voxel-{}_world_map.pcd", SAVE_DIR, DOWNSAMPLE_VOXEL_SIZE);
     std::fs::create_dir_all(SAVE_DIR)?;
     save_pcd_xyz(&world_map_points, &world_map_path)?;
     log::info!(

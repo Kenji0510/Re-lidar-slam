@@ -1,4 +1,5 @@
 use nalgebra::{Matrix3, SMatrix, SVector, UnitQuaternion, Vector3};
+use rayon::prelude::*;
 
 use crate::find_nearest_points::PointCorrespondence;
 
@@ -44,43 +45,48 @@ pub fn build_point_to_plane_system(
     r_mat: &Matrix3<f32>,
     t_vec: &Vector3<f32>,
 ) -> IcpLinearSystem {
-    let mut system = IcpLinearSystem::default();
+    type Accum = (Matrix6f, Vector6f, f32, usize);
 
-    for corr in correspondences {
-        let rp = r_mat * corr.src_point.coords; // R * p_s
-        let transformed = rp + t_vec; // R * p_s + t
+    let (h, b, cost, used_count) = correspondences
+        .par_iter()
+        .fold(
+            || (Matrix6f::zeros(), Vector6f::zeros(), 0.0f32, 0usize),
+            |(mut h, mut b, mut cost, mut cnt), corr| {
+                let rp = r_mat * corr.src_point.coords;
+                let transformed = rp + t_vec;
 
-        // target: 実点を使う（ボクセル中心より精度が高い）
-        let target_pt = if corr.target_cell.is_point {
-            corr.target_cell.point.0
-        } else {
-            corr.target_cell.mean
-        };
+                let target_pt = if corr.target_cell.is_point {
+                    corr.target_cell.point.0
+                } else {
+                    corr.target_cell.mean
+                };
 
-        // 残差（スカラー）
-        let residual = corr
-            .plane_normal
-            .dot(&(transformed - target_pt.coords));
+                let residual = corr.plane_normal.dot(&(transformed - target_pt.coords));
 
-        // J_rot = R*p_s × n,  J_trans = n
-        let j_rot = rp.cross(&corr.plane_normal);
-        let j_trans = corr.plane_normal;
+                let j_rot = rp.cross(&corr.plane_normal);
+                let j_trans = corr.plane_normal;
 
-        let mut j = Vector6f::zeros();
-        j[0] = j_rot.x;
-        j[1] = j_rot.y;
-        j[2] = j_rot.z;
-        j[3] = j_trans.x;
-        j[4] = j_trans.y;
-        j[5] = j_trans.z;
+                let mut j = Vector6f::zeros();
+                j[0] = j_rot.x;
+                j[1] = j_rot.y;
+                j[2] = j_rot.z;
+                j[3] = j_trans.x;
+                j[4] = j_trans.y;
+                j[5] = j_trans.z;
 
-        system.h += j * j.transpose();
-        system.b -= j * residual; // b = -Σ J^T r  (Gauss-Newton: H δ = -g = b)
-        system.cost += residual * residual;
-        system.used_count += 1;
-    }
+                h += j * j.transpose();
+                b -= j * residual;
+                cost += residual * residual;
+                cnt += 1;
+                (h, b, cost, cnt)
+            },
+        )
+        .reduce(
+            || (Matrix6f::zeros(), Vector6f::zeros(), 0.0f32, 0usize),
+            |(h1, b1, c1, n1): Accum, (h2, b2, c2, n2): Accum| (h1 + h2, b1 + b2, c1 + c2, n1 + n2),
+        );
 
-    system
+    IcpLinearSystem { h, b, cost, used_count }
 }
 
 /// 線形システムを解いて pose 差分 δ = [δθ; δt] を返す。

@@ -1,4 +1,5 @@
 use nalgebra::{Matrix3, Point3, Vector3};
+use rayon::prelude::*;
 
 use crate::voxel_map::{VoxelCell, VoxelKey, VoxelMap, voxel_key};
 
@@ -152,7 +153,7 @@ pub fn pickup_valid_source_points<'a>(
     let max_neighbor_dist_sq = (target_voxel_size * max_dist_factor).powi(2);
 
     source_map
-        .iter()
+        .par_iter()
         .filter_map(|(src_key, src_cell)| {
             let src_point = src_cell.point.0;
 
