@@ -118,3 +118,28 @@ pub fn apply_delta(
 
     (new_r, new_t)
 }
+
+/// Point-to-Plane RMSE を計算する。
+/// RMSE = sqrt( Σ e² / n ),  e = n^T * (R*p_s + t - p_t)
+pub fn compute_rmse(
+    correspondences: &[PointCorrespondence],
+    r_mat: &Matrix3<f32>,
+    t_vec: &Vector3<f32>,
+) -> f32 {
+    if correspondences.is_empty() {
+        return f32::INFINITY;
+    }
+
+    let sum_sq: f32 = correspondences
+        .iter()
+        .map(|corr| {
+            let transformed = r_mat * corr.src_point.coords + t_vec;
+            let e = corr
+                .plane_normal
+                .dot(&(transformed - corr.target_cell.mean.coords));
+            e * e
+        })
+        .sum();
+
+    (sum_sq / correspondences.len() as f32).sqrt()
+}

@@ -4,7 +4,7 @@ use re_lidar_slam::{
     deskew_points::deskew_points,
     file_handler::{load_imu_data, load_pcd_files, load_pcd_xyzit},
     find_nearest_points::pickup_valid_source_points,
-    icp::{apply_delta, build_point_to_plane_system, solve_icp_delta},
+    icp::{apply_delta, build_point_to_plane_system, compute_rmse, solve_icp_delta},
     predict_pose_by_imu::{align_imu_timestamps, build_rotation_trajectory, predict_pose_by_imu},
     types::{CurrentFrameInfo, SLAMMap},
     voxel_map::{LOCALMap, LocalMapConfig, build_voxel_map},
@@ -36,6 +36,7 @@ const PLANE_FIT_THRESHOLD: f32 = 0.1; // Threshold for plane fitting
 const MAX_POINTS_PER_VOXEL: usize = 8; // Max points collected per voxel (for covariance)
 
 const ICP_ITERATIONS: usize = 5; // Default: 5
+const ICP_RMSE_THRESHOLD: f32 = 1e-4; // 収束判定: RMSE の変化量がこれ以下なら停止
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
@@ -174,6 +175,7 @@ fn main() -> Result<()> {
         let mut r_mat: Matrix3<f32> = pred_pose.fixed_view::<3, 3>(0, 0).into();
         let mut t_vec: Vector3<f32> = pred_pose.fixed_view::<3, 1>(0, 3).into();
 
+        let mut prev_rmse = f32::INFINITY;
         for _iter in 0..ICP_ITERATIONS {
             // 対応点をピックアップ（現在の (R,t) で変換した src_point を基準に探索）
             let correspondences = pickup_valid_source_points(
@@ -189,12 +191,6 @@ fn main() -> Result<()> {
             // 線形システム構築
             let system = build_point_to_plane_system(&correspondences, &r_mat, &t_vec);
 
-            log::debug!(
-                "ICP iter {_iter}: used={}, cost={:.4}",
-                system.used_count,
-                system.cost
-            );
-
             // 解く → pose 更新
             match solve_icp_delta(&system, 1e-6) {
                 Some(delta) => {
@@ -205,6 +201,21 @@ fn main() -> Result<()> {
                     break;
                 }
             }
+
+            // RMSE を計算して収束チェック
+            let rmse = compute_rmse(&correspondences, &r_mat, &t_vec);
+            log::debug!(
+                "ICP iter {_iter}: used={}, cost={:.6}, rmse={:.6}",
+                system.used_count,
+                system.cost,
+                rmse
+            );
+
+            if (prev_rmse - rmse).abs() < ICP_RMSE_THRESHOLD {
+                log::debug!("ICP converged at iter {_iter} (|Δrmse|={:.2e})", (prev_rmse - rmse).abs());
+                break;
+            }
+            prev_rmse = rmse;
         }
         // --- ICP (Point to Plane) ---
     }
