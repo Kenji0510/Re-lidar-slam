@@ -50,10 +50,17 @@ pub fn build_point_to_plane_system(
         let rp = r_mat * corr.src_point.coords; // R * p_s
         let transformed = rp + t_vec; // R * p_s + t
 
+        // target: 実点を使う（ボクセル中心より精度が高い）
+        let target_pt = if corr.target_cell.is_point {
+            corr.target_cell.point.0
+        } else {
+            corr.target_cell.mean
+        };
+
         // 残差（スカラー）
         let residual = corr
             .plane_normal
-            .dot(&(transformed - corr.target_cell.mean.coords));
+            .dot(&(transformed - target_pt.coords));
 
         // J_rot = R*p_s × n,  J_trans = n
         let j_rot = rp.cross(&corr.plane_normal);
@@ -68,7 +75,7 @@ pub fn build_point_to_plane_system(
         j[5] = j_trans.z;
 
         system.h += j * j.transpose();
-        system.b += j * residual;
+        system.b -= j * residual; // b = -Σ J^T r  (Gauss-Newton: H δ = -g = b)
         system.cost += residual * residual;
         system.used_count += 1;
     }
@@ -133,10 +140,13 @@ pub fn compute_rmse(
     let sum_sq: f32 = correspondences
         .iter()
         .map(|corr| {
+            let target_pt = if corr.target_cell.is_point {
+                corr.target_cell.point.0
+            } else {
+                corr.target_cell.mean
+            };
             let transformed = r_mat * corr.src_point.coords + t_vec;
-            let e = corr
-                .plane_normal
-                .dot(&(transformed - corr.target_cell.mean.coords));
+            let e = corr.plane_normal.dot(&(transformed - target_pt.coords));
             e * e
         })
         .sum();

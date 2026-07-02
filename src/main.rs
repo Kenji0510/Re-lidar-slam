@@ -2,17 +2,17 @@ use anyhow::Result;
 use nalgebra::{Matrix3, Matrix4, Point3, Quaternion, UnitQuaternion, Vector3};
 use re_lidar_slam::{
     deskew_points::deskew_points,
-    file_handler::{load_imu_data, load_pcd_files, load_pcd_xyzit},
+    file_handler::{load_imu_data, load_pcd_files, load_pcd_xyzit, save_pcd_xyz},
     find_nearest_points::pickup_valid_source_points,
     icp::{apply_delta, build_point_to_plane_system, compute_rmse, solve_icp_delta},
     predict_pose_by_imu::{align_imu_timestamps, build_rotation_trajectory, predict_pose_by_imu},
-    types::{CurrentFrameInfo, SLAMMap},
+    types::{CurrentFrameInfo, PointXYZ, SLAMMap},
     voxel_map::{LOCALMap, LocalMapConfig, build_voxel_map},
     voxelization::voxel_downsample_points,
 };
 
 const LOAD_DIR: &str = "/home/kenji/workspace/rust/gicp-slam-vulkan/data/input/06212026/park05";
-const SAVE_DIR: &str = "data/output/06212026/debug";
+const SAVE_DIR: &str = "data/output/debug";
 
 const MIN_DIST: f32 = 0.1;
 const MAX_DIST: f32 = 40.0;
@@ -37,6 +37,7 @@ const MAX_POINTS_PER_VOXEL: usize = 8; // Max points collected per voxel (for co
 
 const ICP_ITERATIONS: usize = 5; // Default: 5
 const ICP_RMSE_THRESHOLD: f32 = 1e-4; // 収束判定: RMSE の変化量がこれ以下なら停止
+const ICP_RMSE_DIVERGE_THRESHOLD: f32 = 2.0; // 発散判定: RMSE がこれ以上なら結果棄却→IMU予測にフォールバック
 
 const MAX_DIST_FOR_VOXEL_MAP: f32 = 40.0;
 
@@ -77,7 +78,7 @@ fn main() -> Result<()> {
 
     // <--- Initialize SLAM map --->
     let map_config = LocalMapConfig {
-        index_voxel_size: 1.0,
+        index_voxel_size: 0.2,
         max_points_per_voxel: 20,
         min_points_per_voxel: 3,
         min_observed_frames_per_voxel: 3,
@@ -91,7 +92,6 @@ fn main() -> Result<()> {
     // <--- Initialize SLAM map --->
 
     let mut prev_frame_start_time: f64 = 0.0;
-    let mut target_points: Vec<Point3<f32>> = Vec::new();
 
     //
     for (i, pcd_path) in pcd_files.iter().enumerate() {
@@ -148,11 +148,6 @@ fn main() -> Result<()> {
             voxel_downsample_points(&deskewed_points, DOWNSAMPLE_VOXEL_SIZE);
         // --- Downsample deskewed points ---
 
-        // --- Downsample target points ---
-        let downsampled_target_points =
-            voxel_downsample_points(&target_points, DOWNSAMPLE_VOXEL_SIZE);
-        // --- Downsample target points ---
-
         // --- Build voxel map for source points ---
         let source_voxel_map = build_voxel_map(
             &downsampled_source_points,
@@ -162,15 +157,6 @@ fn main() -> Result<()> {
         );
         // --- Build voxel map for source points ---
 
-        // --- Build voxel map for target points ---
-        let target_voxel_map = build_voxel_map(
-            &downsampled_target_points,
-            DOWNSAMPLE_VOXEL_SIZE,
-            NEIGHBOR_RANGE,
-            true,
-        );
-        // --- Build voxel map for target points ---
-
         // --- ICP (Point to Plane) ---
         // IMU 予測姿勢を初期値として (R, t) を取り出す
         let pred_pose = pose_prediction.0.cast::<f32>();
@@ -178,46 +164,75 @@ fn main() -> Result<()> {
         let mut t_vec: Vector3<f32> = pred_pose.fixed_view::<3, 1>(0, 3).into();
 
         let mut prev_rmse = f32::INFINITY;
-        for _iter in 0..ICP_ITERATIONS {
-            // 対応点をピックアップ（現在の (R,t) で変換した src_point を基準に探索）
-            let correspondences = pickup_valid_source_points(
-                &source_voxel_map,
-                &target_voxel_map,
-                DOWNSAMPLE_VOXEL_SIZE,
-                SEARCH_RANGE,
-                KNN_K,
-                MAX_DIST_FACTOR,
-                PLANE_FIT_THRESHOLD,
-            );
+        let mut icp_ok = false; // ICP が有効な解を得られたか
 
-            // 線形システム構築
-            let system = build_point_to_plane_system(&correspondences, &r_mat, &t_vec);
+        if slam_map.local_voxel_map.voxel_map.is_empty() {
+            log::debug!("Frame {i}: local map empty, skipping ICP");
+        } else {
+            for _iter in 0..ICP_ITERATIONS {
+                // 対応点をピックアップ
+                // - source はローカル座標、target (local_voxel_map) はワールド座標
+                // - 現在の (R,t) 推定値で source をワールド変換してから近傍探索
+                let correspondences = pickup_valid_source_points(
+                    &source_voxel_map,
+                    &slam_map.local_voxel_map.voxel_map,
+                    slam_map.local_voxel_map.config.index_voxel_size,
+                    SEARCH_RANGE,
+                    KNN_K,
+                    MAX_DIST_FACTOR,
+                    PLANE_FIT_THRESHOLD,
+                    &r_mat,
+                    &t_vec,
+                );
 
-            // 解く → pose 更新
-            match solve_icp_delta(&system, 1e-6) {
-                Some(delta) => {
-                    (r_mat, t_vec) = apply_delta(&r_mat, &t_vec, &delta);
+                // 線形システム構築
+                let system = build_point_to_plane_system(&correspondences, &r_mat, &t_vec);
+
+                // 解く → pose 更新
+                match solve_icp_delta(&system, 1e-6) {
+                    Some(delta) => {
+                        (r_mat, t_vec) = apply_delta(&r_mat, &t_vec, &delta);
+                        icp_ok = true;
+                    }
+                    None => {
+                        log::warn!("ICP iter {_iter}: solve failed (too few correspondences)");
+                        break;
+                    }
                 }
-                None => {
-                    log::warn!("ICP iter {_iter}: solve failed (too few correspondences)");
+
+                // RMSE を計算して収束チェック
+                let rmse = compute_rmse(&correspondences, &r_mat, &t_vec);
+                log::debug!(
+                    "ICP iter {_iter}: used={}, cost={:.6}, rmse={:.6}",
+                    system.used_count,
+                    system.cost,
+                    rmse
+                );
+
+                // RMSE が発散した場合は ICP 結果を棄却して IMU 予測に戻す
+                if rmse > ICP_RMSE_DIVERGE_THRESHOLD {
+                    log::warn!(
+                        "ICP iter {_iter}: RMSE diverged ({rmse:.4}), reverting to IMU prediction"
+                    );
+                    r_mat = pred_pose.fixed_view::<3, 3>(0, 0).into();
+                    t_vec = pred_pose.fixed_view::<3, 1>(0, 3).into();
+                    icp_ok = false;
                     break;
                 }
+
+                if (prev_rmse - rmse).abs() < ICP_RMSE_THRESHOLD {
+                    log::debug!(
+                        "ICP converged at iter {_iter} (|Δrmse|={:.2e})",
+                        (prev_rmse - rmse).abs()
+                    );
+                    break;
+                }
+                prev_rmse = rmse;
             }
 
-            // RMSE を計算して収束チェック
-            let rmse = compute_rmse(&correspondences, &r_mat, &t_vec);
-            log::debug!(
-                "ICP iter {_iter}: used={}, cost={:.6}, rmse={:.6}",
-                system.used_count,
-                system.cost,
-                rmse
-            );
-
-            if (prev_rmse - rmse).abs() < ICP_RMSE_THRESHOLD {
-                log::debug!("ICP converged at iter {_iter} (|Δrmse|={:.2e})", (prev_rmse - rmse).abs());
-                break;
+            if !icp_ok {
+                log::warn!("Frame {i}: ICP failed, using IMU prediction");
             }
-            prev_rmse = rmse;
         }
         // --- ICP (Point to Plane) ---
 
@@ -237,8 +252,39 @@ fn main() -> Result<()> {
             &current_frame_info.current_global_pose,
         );
         // --- Update the LocalMap with the new frame's points ---
-        
+
+        // --- Update the WorldMap with the new frame's points ---
+        slam_map.global_voxel_map.update_world_map(
+            &downsampled_source_points,
+            &current_frame_info.current_global_pose,
+        );
+        // --- Update the WorldMap with the new frame's points ---
+
+        prev_frame_start_time = current_frame_start_time;
     }
+
+    // --- Save the final global voxel map to a PCD file ---
+    let world_map_points: Vec<PointXYZ> = slam_map
+        .global_voxel_map
+        .voxel_map
+        .values()
+        .filter(|cell| cell.is_point)
+        .map(|cell| PointXYZ {
+            x: cell.point.0.x,
+            y: cell.point.0.y,
+            z: cell.point.0.z,
+        })
+        .collect();
+
+    let world_map_path = format!("{}/world_map.pcd", SAVE_DIR);
+    std::fs::create_dir_all(SAVE_DIR)?;
+    save_pcd_xyz(&world_map_points, &world_map_path)?;
+    log::info!(
+        "Saved world map: {} points → {}",
+        world_map_points.len(),
+        world_map_path
+    );
+    // --- Save the final global voxel map to a PCD file ---
 
     Ok(())
 }

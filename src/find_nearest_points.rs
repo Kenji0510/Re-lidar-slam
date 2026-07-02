@@ -52,13 +52,19 @@ pub fn check_points_on_plane(
 /// Fast-LIO2 スタイルの「source 点が平面に十分近いか」判定。
 ///
 /// ```text
-/// pd2 = normal·src + d          (符号付き距離、normal は正規化済み)
-/// s   = 1 - 0.9 * |pd2| / sqrt(‖src‖)
+/// pd2 = normal·world_point + d        (ワールド座標での符号付き距離)
+/// s   = 1 - 0.9 * |pd2| / sqrt(sensor_dist)
 /// 有効: s > 0.9
 /// ```
-pub fn check_source_on_plane(normal: &Vector3<f32>, d: f32, source_point: &Point3<f32>) -> bool {
-    let pd2 = normal.dot(&source_point.coords) + d;
-    let s = 1.0 - 0.9 * pd2.abs() / source_point.coords.norm().sqrt();
+/// `sensor_dist`: センサ原点からの距離 (= src_point.coords.norm())
+pub fn check_source_on_plane(
+    normal: &Vector3<f32>,
+    d: f32,
+    world_point: &Point3<f32>,
+    sensor_dist: f32,
+) -> bool {
+    let pd2 = normal.dot(&world_point.coords) + d;
+    let s = 1.0 - 0.9 * pd2.abs() / sensor_dist.sqrt().max(1e-6);
     s > 0.9
 }
 
@@ -124,31 +130,39 @@ fn find_k_nearest_target_voxels<'a>(
 /// source_map の各点について target_map から k 近傍セルを探し、
 /// 以下の条件をすべて満たす場合のみ対応点として返す:
 ///   1. 近傍点がちょうど k 個見つかった
-///   2. k 番目（最遠）の距離が `voxel_size * max_dist_factor` 以内
+///   2. k 番目（最遠）の距離が `target_voxel_size * max_dist_factor` 以内
 ///   3. k 点が平面を形成できる (`plane_fit_threshold`)
 ///   4. source 点がその平面に十分近い (Fast-LIO2 基準 s > 0.9)
 ///
-/// 返り値の `target_cell` は k 近傍中の**最近傍**セル（ICP 対応点）。
+/// **座標系**: source 点はセンサローカル座標、target_map はワールド座標。
+/// `r_mat` / `t_vec` は現在の ICP 推定姿勢で、対応点探索時に source を
+/// ワールド座標に変換するために使う。
+/// 返り値の `src_point` は**ローカル座標**（ICP ヤコビアン計算用）。
 pub fn pickup_valid_source_points<'a>(
     source_map: &VoxelMap,
     target_map: &'a VoxelMap,
-    voxel_size: f32,
+    target_voxel_size: f32,
     search_range: i32,
     k: usize,
     max_dist_factor: f32,
     plane_fit_threshold: f32,
+    r_mat: &Matrix3<f32>,
+    t_vec: &Vector3<f32>,
 ) -> Vec<PointCorrespondence<'a>> {
-    let max_neighbor_dist_sq = (voxel_size * max_dist_factor).powi(2);
+    let max_neighbor_dist_sq = (target_voxel_size * max_dist_factor).powi(2);
 
     source_map
         .iter()
         .filter_map(|(src_key, src_cell)| {
             let src_point = src_cell.point.0;
 
+            // ローカル座標 → ワールド座標（現在の (R,t) 推定値を使用）
+            let query_point = Point3::from(r_mat * src_point.coords + t_vec);
+
             let neighbors = find_k_nearest_target_voxels(
-                &src_point,
+                &query_point,
                 target_map,
-                voxel_size,
+                target_voxel_size,
                 search_range,
                 max_neighbor_dist_sq,
                 k,
@@ -164,8 +178,11 @@ pub fn pickup_valid_source_points<'a>(
                 return None;
             }
 
-            // 条件3 & 4: 平面フィッティング
-            let neighbor_points: Vec<Point3<f32>> = neighbors.iter().map(|(c, _)| c.mean).collect();
+            // 条件3 & 4: 平面フィッティング（実点を優先、なければボクセル中心）
+            let neighbor_points: Vec<Point3<f32>> = neighbors
+                .iter()
+                .map(|(c, _)| if c.is_point { c.point.0 } else { c.mean })
+                .collect();
 
             let (normal, d) = fit_plane(&neighbor_points)?;
 
@@ -173,7 +190,9 @@ pub fn pickup_valid_source_points<'a>(
                 return None;
             }
 
-            if !check_source_on_plane(&normal, d, &src_point) {
+            // センサ原点からの距離でスケールした閾値（ローカル座標の norm を使用）
+            let sensor_dist = src_point.coords.norm();
+            if !check_source_on_plane(&normal, d, &query_point, sensor_dist) {
                 return None;
             }
 
