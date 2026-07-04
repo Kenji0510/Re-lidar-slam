@@ -11,7 +11,7 @@ use re_lidar_slam::{
     voxelization::voxel_downsample_points,
 };
 
-const LOAD_DIR: &str = "data/input/05242026/path04";
+const LOAD_DIR: &str = "/home/kenji/workspace/rust/gicp-slam-vulkan/data/input/06212026/park05";
 const SAVE_DIR: &str = "data/output/debug/07042026";
 
 const MIN_DIST: f32 = 0.5;
@@ -25,7 +25,9 @@ const IMU_TO_LIDAR_QUAT_Y: f64 = 0.708767;
 const IMU_TO_LIDAR_QUAT_Z: f64 = -0.00246579;
 const IMU_TO_LIDAR_QUAT_W: f64 = 0.00097028;
 
-const DOWNSAMPLE_VOXEL_SIZE: f32 = 0.25; // m
+const DOWNSAMPLE_VOXEL_SIZE: f32 = 0.5; // m
+const LOCAL_MAP_VOXEL_SIZE: f32 = 0.5; // m
+const GLOBAL_MAP_VOXEL_SIZE: f32 = 0.25; // m
 
 const NEIGHBOR_RANGE: i32 = 2; // Voxel search range for nearest neighbor search
 
@@ -84,8 +86,17 @@ fn main() -> Result<()> {
     // <--- Initialize current frame info --->
 
     // <--- Initialize SLAM map --->
-    let map_config = LocalMapConfig {
-        index_voxel_size: DOWNSAMPLE_VOXEL_SIZE,
+    let local_map_config = LocalMapConfig {
+        index_voxel_size: LOCAL_MAP_VOXEL_SIZE,
+        max_points_per_voxel: 20,
+        min_points_per_voxel: 3,
+        min_observed_frames_per_voxel: 3,
+        max_frames: 50,
+        max_distance: MAX_DIST_FOR_VOXEL_MAP,
+    };
+
+    let global_map_config = LocalMapConfig {
+        index_voxel_size: GLOBAL_MAP_VOXEL_SIZE,
         max_points_per_voxel: 20,
         min_points_per_voxel: 3,
         min_observed_frames_per_voxel: 3,
@@ -93,8 +104,8 @@ fn main() -> Result<()> {
         max_distance: MAX_DIST_FOR_VOXEL_MAP,
     };
     let mut slam_map = SLAMMap {
-        global_voxel_map: LOCALMap::new(map_config),
-        local_voxel_map: LOCALMap::new(map_config),
+        global_voxel_map: LOCALMap::new(global_map_config),
+        local_voxel_map: LOCALMap::new(local_map_config),
     };
     // <--- Initialize SLAM map --->
 
@@ -154,13 +165,15 @@ fn main() -> Result<()> {
 
         // --- Downsample deskewed points ---
         let voxel_start = std::time::Instant::now();
-        let downsampled_source_points =
-            voxel_downsample_points(&deskewed_points, DOWNSAMPLE_VOXEL_SIZE);
+        let downsampled_source_points_for_local =
+            voxel_downsample_points(&deskewed_points, LOCAL_MAP_VOXEL_SIZE);
+        let downsampled_source_points_for_global =
+            voxel_downsample_points(&deskewed_points, GLOBAL_MAP_VOXEL_SIZE);
         let voxel_end = voxel_start.elapsed();
         log::debug!(
             "Frame {i}: Downsampled {} points → {} points in {:.2?}",
             deskewed_points.len(),
-            downsampled_source_points.len(),
+            downsampled_source_points_for_local.len(),
             voxel_end
         );
         // --- Downsample deskewed points ---
@@ -168,8 +181,8 @@ fn main() -> Result<()> {
         // --- Build voxel map for source points ---
         let build_map_start = std::time::Instant::now();
         let source_voxel_map = build_voxel_map(
-            &downsampled_source_points,
-            DOWNSAMPLE_VOXEL_SIZE,
+            &downsampled_source_points_for_local,
+            LOCAL_MAP_VOXEL_SIZE,
             NEIGHBOR_RANGE,
             false,
         );
@@ -301,14 +314,14 @@ fn main() -> Result<()> {
 
         // --- Update the LocalMap with the new frame's points ---
         slam_map.local_voxel_map.update_with_new_frame(
-            &downsampled_source_points,
+            &downsampled_source_points_for_local,
             &current_frame_info.current_global_pose,
         );
         // --- Update the LocalMap with the new frame's points ---
 
         // --- Update the WorldMap with the new frame's points ---
         slam_map.global_voxel_map.update_world_map(
-            &downsampled_source_points,
+            &downsampled_source_points_for_global,
             &current_frame_info.current_global_pose,
         );
         // --- Update the WorldMap with the new frame's points ---
@@ -329,7 +342,7 @@ fn main() -> Result<()> {
         })
         .collect();
 
-    let world_map_path = format!("{}/voxel-{}_world_map.pcd", SAVE_DIR, DOWNSAMPLE_VOXEL_SIZE);
+    let world_map_path = format!("{}/voxel-{}_world_map.pcd", SAVE_DIR, GLOBAL_MAP_VOXEL_SIZE);
     std::fs::create_dir_all(SAVE_DIR)?;
     save_pcd_xyz(&world_map_points, &world_map_path)?;
     log::info!(
