@@ -6,15 +6,15 @@ use re_lidar_slam::{
     find_nearest_points::pickup_valid_source_points,
     icp::{apply_delta, build_point_to_plane_system, compute_rmse, solve_icp_delta},
     predict_pose_by_imu::{align_imu_timestamps, build_rotation_trajectory, predict_pose_by_imu},
-    types::{CurrentFrameInfo, PointXYZ, SLAMMap},
+    types::{CurrentFrameInfo, PointXYZ, ProcessTimes, SLAMMap},
     voxel_map::{LOCALMap, LocalMapConfig, build_voxel_map},
     voxelization::voxel_downsample_points,
 };
 
-const LOAD_DIR: &str = "/home/kenji/workspace/rust/gicp-slam-vulkan/data/input/06212026/park05";
-const SAVE_DIR: &str = "data/output/debug";
+const LOAD_DIR: &str = "data/input/05242026/path04";
+const SAVE_DIR: &str = "data/output/debug/07042026";
 
-const MIN_DIST: f32 = 0.1;
+const MIN_DIST: f32 = 0.5;
 const MAX_DIST: f32 = 40.0;
 
 // IMU coordination to LiDAR coordination (Robosense 96 beam)
@@ -25,7 +25,7 @@ const IMU_TO_LIDAR_QUAT_Y: f64 = 0.708767;
 const IMU_TO_LIDAR_QUAT_Z: f64 = -0.00246579;
 const IMU_TO_LIDAR_QUAT_W: f64 = 0.00097028;
 
-const DOWNSAMPLE_VOXEL_SIZE: f32 = 0.1; // m
+const DOWNSAMPLE_VOXEL_SIZE: f32 = 0.25; // m
 
 const NEIGHBOR_RANGE: i32 = 2; // Voxel search range for nearest neighbor search
 
@@ -43,6 +43,13 @@ const MAX_DIST_FOR_VOXEL_MAP: f32 = 40.0;
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
+
+    let mut process_times = ProcessTimes {
+        total: 0.0,
+        find_nearest_points: 0.0,
+        icp: 0.0,
+        update_map: 0.0,
+    };
 
     // <--- Loading each data --->
     let pcd_dir = format!("{}/pcd", LOAD_DIR);
@@ -92,6 +99,8 @@ fn main() -> Result<()> {
     // <--- Initialize SLAM map --->
 
     let mut prev_frame_start_time: f64 = 0.0;
+
+    let start_time = std::time::Instant::now();
 
     //
     for (i, pcd_path) in pcd_files.iter().enumerate() {
@@ -144,17 +153,28 @@ fn main() -> Result<()> {
         // --- Deskew source pcd ---
 
         // --- Downsample deskewed points ---
+        let voxel_start = std::time::Instant::now();
         let downsampled_source_points =
             voxel_downsample_points(&deskewed_points, DOWNSAMPLE_VOXEL_SIZE);
+        let voxel_end = voxel_start.elapsed();
+        log::debug!(
+            "Frame {i}: Downsampled {} points → {} points in {:.2?}",
+            deskewed_points.len(),
+            downsampled_source_points.len(),
+            voxel_end
+        );
         // --- Downsample deskewed points ---
 
         // --- Build voxel map for source points ---
+        let build_map_start = std::time::Instant::now();
         let source_voxel_map = build_voxel_map(
             &downsampled_source_points,
             DOWNSAMPLE_VOXEL_SIZE,
             NEIGHBOR_RANGE,
             false,
         );
+        let build_map_end = build_map_start.elapsed();
+        log::debug!("Frame {i}: Built voxel map in {:.2?}", build_map_end);
         // --- Build voxel map for source points ---
 
         // --- ICP (Point to Plane) ---
@@ -166,6 +186,8 @@ fn main() -> Result<()> {
         let mut prev_rmse = f32::INFINITY;
         let mut icp_ok = false; // ICP が有効な解を得られたか
 
+        let loop_start = std::time::Instant::now();
+
         if slam_map.local_voxel_map.voxel_map.is_empty() {
             log::debug!("Frame {i}: local map empty, skipping ICP");
         } else {
@@ -173,6 +195,7 @@ fn main() -> Result<()> {
                 // 対応点をピックアップ
                 // - source はローカル座標、target (local_voxel_map) はワールド座標
                 // - 現在の (R,t) 推定値で source をワールド変換してから近傍探索
+                let pickup_start = std::time::Instant::now();
                 let correspondences = pickup_valid_source_points(
                     &source_voxel_map,
                     &slam_map.local_voxel_map.voxel_map,
@@ -184,8 +207,15 @@ fn main() -> Result<()> {
                     &r_mat,
                     &t_vec,
                 );
+                let pickup_end = pickup_start.elapsed();
+                log::debug!(
+                    "ICP iter {_iter}: Picked up {} correspondences in {:.2?}",
+                    correspondences.len(),
+                    pickup_end
+                );
 
                 // 線形システム構築
+                let system_start = std::time::Instant::now();
                 let system = build_point_to_plane_system(&correspondences, &r_mat, &t_vec);
 
                 // 解く → pose 更新
@@ -199,6 +229,11 @@ fn main() -> Result<()> {
                         break;
                     }
                 }
+                let system_end = system_start.elapsed();
+                log::debug!(
+                    "ICP iter {_iter}: Built point-to-plane system in {:.2?}",
+                    system_end
+                );
 
                 // RMSE を計算して収束チェック
                 let rmse = compute_rmse(&correspondences, &r_mat, &t_vec);
@@ -234,6 +269,12 @@ fn main() -> Result<()> {
                 log::warn!("Frame {i}: ICP failed, using IMU prediction");
             }
         }
+        let loop_end = loop_start.elapsed();
+        log::debug!(
+            "Frame {i}: ICP loop finished in {:.2?}, final RMSE={:.6}",
+            loop_end,
+            prev_rmse
+        );
         // --- ICP (Point to Plane) ---
 
         // --- Update current frame info ---

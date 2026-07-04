@@ -66,7 +66,7 @@ pub fn check_source_on_plane(
 ) -> bool {
     let pd2 = normal.dot(&world_point.coords) + d;
     let s = 1.0 - 0.9 * pd2.abs() / sensor_dist.sqrt().max(1e-6);
-    s > 0.55
+    s > 0.9
 }
 
 // ---------------------------------------------------------------------------

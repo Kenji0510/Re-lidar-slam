@@ -86,7 +86,12 @@ pub fn build_point_to_plane_system(
             |(h1, b1, c1, n1): Accum, (h2, b2, c2, n2): Accum| (h1 + h2, b1 + b2, c1 + c2, n1 + n2),
         );
 
-    IcpLinearSystem { h, b, cost, used_count }
+    IcpLinearSystem {
+        h,
+        b,
+        cost,
+        used_count,
+    }
 }
 
 /// 線形システムを解いて pose 差分 δ = [δθ; δt] を返す。

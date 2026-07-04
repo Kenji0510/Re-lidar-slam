@@ -72,3 +72,10 @@ pub struct SLAMMap {
     pub global_voxel_map: LOCALMap,
     pub local_voxel_map: LOCALMap,
 }
+
+pub struct ProcessTimes {
+    pub total: f64,
+    pub find_nearest_points: f64,
+    pub icp: f64,
+    pub update_map: f64,
+}
