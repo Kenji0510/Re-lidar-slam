@@ -63,10 +63,11 @@ pub fn check_source_on_plane(
     d: f32,
     world_point: &Point3<f32>,
     sensor_dist: f32,
+    plane_fit_threshold: f32
 ) -> bool {
     let pd2 = normal.dot(&world_point.coords) + d;
     let s = 1.0 - 0.9 * pd2.abs() / sensor_dist.sqrt().max(1e-6);
-    s > 0.9
+    s > plane_fit_threshold
 }
 
 // ---------------------------------------------------------------------------
@@ -193,7 +194,7 @@ pub fn pickup_valid_source_points<'a>(
 
             // センサ原点からの距離でスケールした閾値（ローカル座標の norm を使用）
             let sensor_dist = src_point.coords.norm();
-            if !check_source_on_plane(&normal, d, &query_point, sensor_dist) {
+            if !check_source_on_plane(&normal, d, &query_point, sensor_dist, plane_fit_threshold) {
                 return None;
             }
 

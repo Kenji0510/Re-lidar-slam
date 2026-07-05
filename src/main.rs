@@ -11,7 +11,7 @@ use re_lidar_slam::{
     voxelization::voxel_downsample_points,
 };
 
-const LOAD_DIR: &str = "/home/kenji/workspace/rust/gicp-slam-vulkan/data/input/06212026/park05";
+const LOAD_DIR: &str = "data/input/05172026/park07";
 const SAVE_DIR: &str = "data/output/debug/07042026";
 
 const MIN_DIST: f32 = 0.5;
@@ -27,14 +27,15 @@ const IMU_TO_LIDAR_QUAT_W: f64 = 0.00097028;
 
 const DOWNSAMPLE_VOXEL_SIZE: f32 = 0.5; // m
 const LOCAL_MAP_VOXEL_SIZE: f32 = 0.5; // m
-const GLOBAL_MAP_VOXEL_SIZE: f32 = 0.25; // m
+const GLOBAL_MAP_VOXEL_SIZE: f32 = 0.05; // m
 
 const NEIGHBOR_RANGE: i32 = 2; // Voxel search range for nearest neighbor search
 
 const KNN_K: usize = 5; // Number of nearest neighbors for plane fitting
 const SEARCH_RANGE: i32 = 2; // Voxel search range for nearest neighbor search
 const MAX_DIST_FACTOR: f32 = 3.0; // Maximum distance factor for nearest neighbor search
-const PLANE_FIT_THRESHOLD: f32 = 0.1; // Threshold for plane fitting
+const PLANE_FIT_THRESHOLD_FOR_LOCAL: f32 = 0.75; // Threshold for plane fitting (Fast-LIO2 基準 s > 0.9)
+const PLANE_FIT_THRESHOLD_FOR_GLOBAL: f32 = 0.75; // Threshold for plane fitting (Fast-LIO2 基準 s > 0.9)
 const MAX_POINTS_PER_VOXEL: usize = 8; // Max points collected per voxel (for covariance)
 
 const ICP_ITERATIONS: usize = 5; // Default: 5
@@ -216,7 +217,7 @@ fn main() -> Result<()> {
                     SEARCH_RANGE,
                     KNN_K,
                     MAX_DIST_FACTOR,
-                    PLANE_FIT_THRESHOLD,
+                    PLANE_FIT_THRESHOLD_FOR_LOCAL,
                     &r_mat,
                     &t_vec,
                 );
@@ -319,12 +320,37 @@ fn main() -> Result<()> {
         );
         // --- Update the LocalMap with the new frame's points ---
 
-        // --- Update the WorldMap with the new frame's points ---
+        // --- Filter valid source points, then update the WorldMap ---
+        // ローカルマップが空（初回フレーム）の場合はフィルタなしで全点追加。
+        // それ以外は pickup_valid_source_points で平面に乗っている点だけ抽出し、
+        // ICP 収束後の最終姿勢 (r_mat, t_vec) でワールドマップに追加する。
+        let global_source_points: Vec<Point3<f32>> =
+            if slam_map.local_voxel_map.voxel_map.is_empty() {
+                downsampled_source_points_for_global.clone()
+            } else {
+                let valid = pickup_valid_source_points(
+                    &source_voxel_map,
+                    &slam_map.local_voxel_map.voxel_map,
+                    slam_map.local_voxel_map.config.index_voxel_size,
+                    SEARCH_RANGE,
+                    KNN_K,
+                    MAX_DIST_FACTOR,
+                    PLANE_FIT_THRESHOLD_FOR_GLOBAL,
+                    &r_mat,
+                    &t_vec,
+                );
+                log::debug!(
+                    "Frame {i}: {} / {} source points passed plane filter for global map",
+                    valid.len(),
+                    source_voxel_map.len(),
+                );
+                valid.into_iter().map(|c| c.src_point).collect()
+            };
         slam_map.global_voxel_map.update_world_map(
-            &downsampled_source_points_for_global,
+            &global_source_points,
             &current_frame_info.current_global_pose,
         );
-        // --- Update the WorldMap with the new frame's points ---
+        // --- Filter valid source points, then update the WorldMap ---
 
         prev_frame_start_time = current_frame_start_time;
     }
