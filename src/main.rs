@@ -6,13 +6,13 @@ use re_lidar_slam::{
     find_nearest_points::pickup_valid_source_points,
     icp::{apply_delta, build_point_to_plane_system, compute_rmse, solve_icp_delta},
     predict_pose_by_imu::{align_imu_timestamps, build_rotation_trajectory, predict_pose_by_imu},
-    types::{CurrentFrameInfo, PointXYZ, ProcessTimes, SLAMMap},
+    types::{CurrentFrameInfo, FrameLog, PointXYZ, ProcessTimes, SLAMMap},
     voxel_map::{LOCALMap, LocalMapConfig, build_voxel_map},
     voxelization::voxel_downsample_points,
 };
 
-const LOAD_DIR: &str = "data/input/05172026/park07";
-const SAVE_DIR: &str = "data/output/debug/07042026";
+const LOAD_DIR: &str = "data/input/05162026/outdoor01";
+const SAVE_DIR: &str = "data/output/debug/07052026";
 
 const MIN_DIST: f32 = 0.5;
 const MAX_DIST: f32 = 40.0;
@@ -39,7 +39,7 @@ const PLANE_FIT_THRESHOLD_FOR_GLOBAL: f32 = 0.75; // Threshold for plane fitting
 const MAX_POINTS_PER_VOXEL: usize = 8; // Max points collected per voxel (for covariance)
 
 const ICP_ITERATIONS: usize = 5; // Default: 5
-const ICP_RMSE_THRESHOLD: f32 = 0.07; // 収束判定: RMSE の変化量がこれ以下なら停止 // voxel size 0.2m の場合、0.07m くらいが妥当
+const ICP_RMSE_THRESHOLD: f32 = 0.01; // 収束判定: RMSE の変化量がこれ以下なら停止 // voxel size 0.2m の場合、0.07m くらいが妥当
 const ICP_RMSE_DIVERGE_THRESHOLD: f32 = 2.0; // 発散判定: RMSE がこれ以上なら結果棄却→IMU予測にフォールバック
 
 const MAX_DIST_FOR_VOXEL_MAP: f32 = 40.0;
@@ -111,6 +111,7 @@ fn main() -> Result<()> {
     // <--- Initialize SLAM map --->
 
     let mut prev_frame_start_time: f64 = 0.0;
+    let mut frame_logs: Vec<FrameLog> = Vec::new();
 
     let start_time = std::time::Instant::now();
 
@@ -296,6 +297,10 @@ fn main() -> Result<()> {
             .current_global_pose
             .fixed_view::<3, 1>(0, 3)
             .into_owned();
+        let prev_r: Matrix3<f64> = current_frame_info
+            .current_global_pose
+            .fixed_view::<3, 3>(0, 0)
+            .into_owned();
 
         let r64 = r_mat.cast::<f64>();
         let t64 = t_vec.cast::<f64>();
@@ -312,6 +317,27 @@ fn main() -> Result<()> {
         current_frame_info.current_global_pose = new_global_pose;
         current_frame_info.current_velocity = new_velocity;
         // --- Update current frame info ---
+
+        // --- Record frame log ---
+        let translation_m = (new_pos - prev_pos).norm();
+        let delta_r = r64 * prev_r.transpose();
+        let rotation_deg = ((delta_r.trace() - 1.0) / 2.0)
+            .clamp(-1.0, 1.0)
+            .acos()
+            .to_degrees();
+        frame_logs.push(FrameLog {
+            frame_index: i,
+            timestamp: current_frame_start_time,
+            icp_ok,
+            rmse: if prev_rmse.is_finite() { Some(prev_rmse) } else { None },
+            translation_m,
+            rotation_deg,
+            velocity_m_s: new_velocity.norm(),
+            pose_x: new_pos.x,
+            pose_y: new_pos.y,
+            pose_z: new_pos.z,
+        });
+        // --- Record frame log ---
 
         // --- Update the LocalMap with the new frame's points ---
         slam_map.local_voxel_map.update_with_new_frame(
@@ -377,6 +403,17 @@ fn main() -> Result<()> {
         world_map_path
     );
     // --- Save the final global voxel map to a PCD file ---
+
+    // --- Save per-frame ICP logs to JSON ---
+    let frame_logs_path = format!("{}/frame_logs.json", SAVE_DIR);
+    let frame_logs_json = serde_json::to_string_pretty(&frame_logs)?;
+    std::fs::write(&frame_logs_path, &frame_logs_json)?;
+    log::info!(
+        "Saved frame logs: {} frames → {}",
+        frame_logs.len(),
+        frame_logs_path
+    );
+    // --- Save per-frame ICP logs to JSON ---
 
     Ok(())
 }

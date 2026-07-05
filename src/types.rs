@@ -79,3 +79,21 @@ pub struct ProcessTimes {
     pub icp: f64,
     pub update_map: f64,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrameLog {
+    pub frame_index: usize,
+    pub timestamp: f64,
+    pub icp_ok: bool,
+    /// Point-to-Plane RMSE [m]. None if ICP was not run (e.g. empty map on first frame).
+    pub rmse: Option<f32>,
+    /// Translation distance from previous frame [m].
+    pub translation_m: f64,
+    /// Rotation angle from previous frame [deg].
+    pub rotation_deg: f64,
+    /// Speed (velocity magnitude) [m/s].
+    pub velocity_m_s: f64,
+    pub pose_x: f64,
+    pub pose_y: f64,
+    pub pose_z: f64,
+}
