@@ -11,8 +11,8 @@ use re_lidar_slam::{
     voxelization::voxel_downsample_points,
 };
 
-const LOAD_DIR: &str = "data/input/05162026/outdoor01";
-const SAVE_DIR: &str = "data/output/debug/07052026";
+const LOAD_DIR: &str = "/home/kenji/mnt/nfs/share/airy96/07112026/park06";
+const SAVE_DIR: &str = "data/output/debug/07112026";
 
 const MIN_DIST: f32 = 0.5;
 const MAX_DIST: f32 = 40.0;
@@ -25,21 +25,21 @@ const IMU_TO_LIDAR_QUAT_Y: f64 = 0.708767;
 const IMU_TO_LIDAR_QUAT_Z: f64 = -0.00246579;
 const IMU_TO_LIDAR_QUAT_W: f64 = 0.00097028;
 
-const DOWNSAMPLE_VOXEL_SIZE: f32 = 0.5; // m
-const LOCAL_MAP_VOXEL_SIZE: f32 = 0.5; // m
-const GLOBAL_MAP_VOXEL_SIZE: f32 = 0.05; // m
+const DOWNSAMPLE_VOXEL_SIZE: f32 = 0.25; // m
+const LOCAL_MAP_VOXEL_SIZE: f32 = 0.25; // m
+const GLOBAL_MAP_VOXEL_SIZE: f32 = 0.1; // m
 
 const NEIGHBOR_RANGE: i32 = 2; // Voxel search range for nearest neighbor search
 
 const KNN_K: usize = 5; // Number of nearest neighbors for plane fitting
 const SEARCH_RANGE: i32 = 2; // Voxel search range for nearest neighbor search
-const MAX_DIST_FACTOR: f32 = 3.0; // Maximum distance factor for nearest neighbor search
+const MAX_DIST_FACTOR: f32 = 2.5; // Maximum distance factor for nearest neighbor search (Prev: 3.0)
 const PLANE_FIT_THRESHOLD_FOR_LOCAL: f32 = 0.75; // Threshold for plane fitting (Fast-LIO2 基準 s > 0.9)
 const PLANE_FIT_THRESHOLD_FOR_GLOBAL: f32 = 0.75; // Threshold for plane fitting (Fast-LIO2 基準 s > 0.9)
 const MAX_POINTS_PER_VOXEL: usize = 8; // Max points collected per voxel (for covariance)
 
 const ICP_ITERATIONS: usize = 5; // Default: 5
-const ICP_RMSE_THRESHOLD: f32 = 0.01; // 収束判定: RMSE の変化量がこれ以下なら停止 // voxel size 0.2m の場合、0.07m くらいが妥当
+const ICP_RMSE_THRESHOLD: f32 = 0.077; // 収束判定: RMSE の変化量がこれ以下なら停止 // voxel size 0.2m の場合、0.07m くらいが妥当
 const ICP_RMSE_DIVERGE_THRESHOLD: f32 = 2.0; // 発散判定: RMSE がこれ以上なら結果棄却→IMU予測にフォールバック
 
 const MAX_DIST_FOR_VOXEL_MAP: f32 = 40.0;
@@ -270,7 +270,8 @@ fn main() -> Result<()> {
                     break;
                 }
 
-                if (prev_rmse - rmse).abs() < ICP_RMSE_THRESHOLD {
+                // if (prev_rmse - rmse).abs() < ICP_RMSE_THRESHOLD {
+                if rmse < ICP_RMSE_THRESHOLD {
                     log::debug!(
                         "ICP converged at iter {_iter} (|Δrmse|={:.2e})",
                         (prev_rmse - rmse).abs()

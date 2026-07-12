@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use plotters::prelude::*;
 use re_lidar_slam::types::FrameLog;
 
-const DEFAULT_JSON: &str = "data/output/debug/07052026/frame_logs.json";
+const DEFAULT_JSON: &str = "data/output/debug/07112026/park06/frame_logs.json";
 
 fn main() -> Result<()> {
     let json_path = std::env::args()
