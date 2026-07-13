@@ -11,8 +11,8 @@ use re_lidar_slam::{
     voxelization::voxel_downsample_points,
 };
 
-const LOAD_DIR: &str = "/home/kenji/mnt/nfs/share/airy96/07112026/park06";
-const SAVE_DIR: &str = "data/output/debug/07112026";
+const LOAD_DIR: &str = "data/input/06212026/park05";
+const SAVE_DIR: &str = "data/output/debug/07122026";
 
 const MIN_DIST: f32 = 0.5;
 const MAX_DIST: f32 = 40.0;
@@ -188,6 +188,12 @@ fn main() -> Result<()> {
             NEIGHBOR_RANGE,
             false,
         );
+        let source_voxel_map_for_global = build_voxel_map(
+            &downsampled_source_points_for_global,
+            GLOBAL_MAP_VOXEL_SIZE,
+            NEIGHBOR_RANGE,
+            false,
+        );
         let build_map_end = build_map_start.elapsed();
         log::debug!("Frame {i}: Built voxel map in {:.2?}", build_map_end);
         // --- Build voxel map for source points ---
@@ -356,7 +362,7 @@ fn main() -> Result<()> {
                 downsampled_source_points_for_global.clone()
             } else {
                 let valid = pickup_valid_source_points(
-                    &source_voxel_map,
+                    &source_voxel_map_for_global,
                     &slam_map.local_voxel_map.voxel_map,
                     slam_map.local_voxel_map.config.index_voxel_size,
                     SEARCH_RANGE,
@@ -369,7 +375,7 @@ fn main() -> Result<()> {
                 log::debug!(
                     "Frame {i}: {} / {} source points passed plane filter for global map",
                     valid.len(),
-                    source_voxel_map.len(),
+                    source_voxel_map_for_global.len(),
                 );
                 valid.into_iter().map(|c| c.src_point).collect()
             };
