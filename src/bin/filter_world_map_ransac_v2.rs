@@ -1,20 +1,11 @@
-use std::{
-    collections::HashMap,
-    env,
-    fs,
-    path::Path,
-    time::Instant,
-};
+use std::{collections::HashMap, env, fs, path::Path, time::Instant};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use nalgebra::{Matrix3, Point3, SymmetricEigen, Vector3};
 use pcd_rs::Reader;
 use rayon::prelude::*;
 
-use re_lidar_slam::{
-    file_handler::save_pcd_xyz,
-    types::PointXYZ,
-};
+use re_lidar_slam::{file_handler::save_pcd_xyz, types::PointXYZ};
 
 /// 完成済みのグローバルマップPCDに対して、局所RANSAC平面フィルタを適用する。
 ///
@@ -32,7 +23,7 @@ use re_lidar_slam::{
 ///         --voxel-size 0.20 \
 ///         --neighbor-range 1 \
 ///         --fit-distance-threshold 0.060 \
-        //  --keep-distance-threshold 0.015 \
+//  --keep-distance-threshold 0.015 \
 ///         --iterations 64 \
 ///         --min-neighbors 12 \
 ///         --min-inliers 8 \
@@ -163,9 +154,7 @@ struct PlaneModel {
 impl PlaneModel {
     #[inline]
     fn distance(&self, point: &Point3<f32>) -> f32 {
-        self.normal
-            .dot(&(point.coords - self.center.coords))
-            .abs()
+        self.normal.dot(&(point.coords - self.center.coords)).abs()
     }
 }
 
@@ -352,7 +341,10 @@ fn main() -> Result<()> {
     println!("Kept plane inliers        : {}", stats.kept_plane_inliers);
     println!("Kept sparse points        : {}", stats.kept_sparse);
     println!("Kept non-planar points    : {}", stats.kept_nonplanar);
-    println!("Removed plane outliers    : {}", stats.removed_plane_outliers);
+    println!(
+        "Removed plane outliers    : {}",
+        stats.removed_plane_outliers
+    );
     println!("Removed non-planar points : {}", stats.removed_nonplanar);
     println!("Kept total                : {}", stats.kept_total());
     println!("Removed total             : {}", stats.removed_total());
@@ -506,9 +498,7 @@ fn classify_voxel(
 
             let is_inlier = planes
                 .iter()
-                .any(|plane| {
-                    plane.distance(point) <= config.keep_distance_threshold
-                });
+                .any(|plane| plane.distance(point) <= config.keep_distance_threshold);
 
             let decision = if is_inlier {
                 PointDecision::KeepPlaneInlier
@@ -526,11 +516,7 @@ fn classify_voxel(
     }
 }
 
-fn collect_neighborhood_indices(
-    grid: &VoxelGrid,
-    center: VoxelKey,
-    range: i32,
-) -> Vec<usize> {
+fn collect_neighborhood_indices(grid: &VoxelGrid, center: VoxelKey, range: i32) -> Vec<usize> {
     let side = (2 * range + 1).max(1) as usize;
     let mut result = Vec::with_capacity(side * side * side * 4);
 
@@ -578,9 +564,7 @@ fn extract_local_planes(
         };
 
         // RANSACで抽出した平面のインライアを次回候補から除外。
-        remaining.retain(|&index| {
-            plane.distance(&points[index]) > config.fit_distance_threshold
-        });
+        remaining.retain(|&index| plane.distance(&points[index]) > config.fit_distance_threshold);
 
         planes.push(plane);
     }
@@ -628,9 +612,7 @@ fn fit_plane_ransac(
         let mut squared_error = 0.0f32;
 
         for &index in candidate_indices {
-            let distance = normal
-                .dot(&(points[index].coords - p0.coords))
-                .abs();
+            let distance = normal.dot(&(points[index].coords - p0.coords)).abs();
 
             if distance <= config.fit_distance_threshold {
                 inlier_count += 1;
@@ -639,8 +621,7 @@ fn fit_plane_ransac(
         }
 
         let is_better = inlier_count > best_inlier_count
-            || (inlier_count == best_inlier_count
-                && squared_error < best_squared_error);
+            || (inlier_count == best_inlier_count && squared_error < best_squared_error);
 
         if is_better {
             best_normal = normal;
@@ -676,9 +657,7 @@ fn fit_plane_ransac(
     let second_inliers: Vec<usize> = candidate_indices
         .iter()
         .copied()
-        .filter(|&index| {
-            first_refined.distance(&points[index]) <= config.fit_distance_threshold
-        })
+        .filter(|&index| first_refined.distance(&points[index]) <= config.fit_distance_threshold)
         .collect();
 
     if second_inliers.len() < config.min_inliers {
@@ -696,9 +675,7 @@ fn fit_plane_ransac(
     let denominator = final_plane.lambda_mid.max(1.0e-12);
     let planarity_ratio = final_plane.lambda_min / denominator;
 
-    if !planarity_ratio.is_finite()
-        || planarity_ratio > config.max_planarity_ratio
-    {
+    if !planarity_ratio.is_finite() || planarity_ratio > config.max_planarity_ratio {
         return None;
     }
 
@@ -714,10 +691,7 @@ fn fit_plane_ransac(
     Some(final_plane)
 }
 
-fn fit_plane_pca(
-    points: &[Point3<f32>],
-    indices: &[usize],
-) -> Option<PlaneModel> {
+fn fit_plane_pca(points: &[Point3<f32>], indices: &[usize]) -> Option<PlaneModel> {
     if indices.len() < 3 {
         return None;
     }
@@ -772,10 +746,7 @@ fn fit_plane_pca(
     })
 }
 
-fn sample_three_unique(
-    rng: &mut XorShift64,
-    length: usize,
-) -> (usize, usize, usize) {
+fn sample_three_unique(rng: &mut XorShift64, length: usize) -> (usize, usize, usize) {
     debug_assert!(length >= 3);
 
     let i0 = rng.index(length);
@@ -819,7 +790,11 @@ fn parse_args() -> Result<CliArgs> {
     }
 
     if args.len() < 3 {
-        print_usage(args.first().map(String::as_str).unwrap_or("filter_world_map_ransac"));
+        print_usage(
+            args.first()
+                .map(String::as_str)
+                .unwrap_or("filter_world_map_ransac"),
+        );
         bail!("Input and output PCD paths are required");
     }
 
@@ -837,14 +812,12 @@ fn parse_args() -> Result<CliArgs> {
                 config.voxel_size = parse_next::<f32>(&args, &mut index, "--voxel-size")?;
             }
             "--neighbor-range" => {
-                config.neighbor_range =
-                    parse_next::<i32>(&args, &mut index, "--neighbor-range")?;
+                config.neighbor_range = parse_next::<i32>(&args, &mut index, "--neighbor-range")?;
             }
             // 後方互換: 両方を同じ値に設定する。
             // 太い壁を薄くする用途では、下の2オプションを個別指定する方がよい。
             "--distance-threshold" => {
-                let value =
-                    parse_next::<f32>(&args, &mut index, "--distance-threshold")?;
+                let value = parse_next::<f32>(&args, &mut index, "--distance-threshold")?;
                 config.fit_distance_threshold = value;
                 config.keep_distance_threshold = value;
             }
@@ -857,16 +830,14 @@ fn parse_args() -> Result<CliArgs> {
                     parse_next::<f32>(&args, &mut index, "--keep-distance-threshold")?;
             }
             "--iterations" => {
-                config.max_iterations =
-                    parse_next::<usize>(&args, &mut index, "--iterations")?;
+                config.max_iterations = parse_next::<usize>(&args, &mut index, "--iterations")?;
             }
             "--min-neighbors" => {
                 config.min_neighbor_points =
                     parse_next::<usize>(&args, &mut index, "--min-neighbors")?;
             }
             "--min-inliers" => {
-                config.min_inliers =
-                    parse_next::<usize>(&args, &mut index, "--min-inliers")?;
+                config.min_inliers = parse_next::<usize>(&args, &mut index, "--min-inliers")?;
             }
             "--min-inlier-ratio" => {
                 config.min_inlier_ratio =
@@ -914,11 +885,7 @@ fn parse_args() -> Result<CliArgs> {
     })
 }
 
-fn parse_next<T>(
-    args: &[String],
-    index: &mut usize,
-    option_name: &str,
-) -> Result<T>
+fn parse_next<T>(args: &[String], index: &mut usize, option_name: &str) -> Result<T>
 where
     T: std::str::FromStr,
     T::Err: std::fmt::Display,
@@ -943,22 +910,16 @@ fn validate_config(config: &FilterConfig) -> Result<()> {
         bail!("neighbor_range must be >= 0");
     }
 
-    if !config.fit_distance_threshold.is_finite()
-        || config.fit_distance_threshold <= 0.0
-    {
+    if !config.fit_distance_threshold.is_finite() || config.fit_distance_threshold <= 0.0 {
         bail!("fit_distance_threshold must be finite and > 0");
     }
 
-    if !config.keep_distance_threshold.is_finite()
-        || config.keep_distance_threshold <= 0.0
-    {
+    if !config.keep_distance_threshold.is_finite() || config.keep_distance_threshold <= 0.0 {
         bail!("keep_distance_threshold must be finite and > 0");
     }
 
     if config.keep_distance_threshold > config.fit_distance_threshold {
-        bail!(
-            "keep_distance_threshold must be <= fit_distance_threshold"
-        );
+        bail!("keep_distance_threshold must be <= fit_distance_threshold");
     }
 
     if config.max_iterations == 0 {
@@ -981,15 +942,11 @@ fn validate_config(config: &FilterConfig) -> Result<()> {
         bail!("min_inlier_ratio must be in [0, 1]");
     }
 
-    if !config.max_planarity_ratio.is_finite()
-        || config.max_planarity_ratio < 0.0
-    {
+    if !config.max_planarity_ratio.is_finite() || config.max_planarity_ratio < 0.0 {
         bail!("max_planarity_ratio must be finite and >= 0");
     }
 
-    if !config.min_planar_spread.is_finite()
-        || config.min_planar_spread < 0.0
-    {
+    if !config.min_planar_spread.is_finite() || config.min_planar_spread < 0.0 {
         bail!("min_planar_spread must be finite and >= 0");
     }
 

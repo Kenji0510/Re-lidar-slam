@@ -63,7 +63,7 @@ pub fn check_source_on_plane(
     d: f32,
     world_point: &Point3<f32>,
     sensor_dist: f32,
-    plane_fit_threshold: f32
+    plane_fit_threshold: f32,
 ) -> bool {
     let pd2 = normal.dot(&world_point.coords) + d;
     let s = 1.0 - 0.9 * pd2.abs() / sensor_dist.sqrt().max(1e-6);

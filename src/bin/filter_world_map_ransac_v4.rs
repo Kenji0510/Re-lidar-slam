@@ -1,20 +1,11 @@
-use std::{
-    collections::HashMap,
-    env,
-    fs,
-    path::Path,
-    time::Instant,
-};
+use std::{collections::HashMap, env, fs, path::Path, time::Instant};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use nalgebra::{Matrix3, Point3, SymmetricEigen, Vector3};
 use pcd_rs::Reader;
 use rayon::prelude::*;
 
-use re_lidar_slam::{
-    file_handler::save_pcd_xyz,
-    types::PointXYZ,
-};
+use re_lidar_slam::{file_handler::save_pcd_xyz, types::PointXYZ};
 
 /// 完成済みのグローバルマップPCDに対して、局所RANSAC平面フィルタを適用する。
 ///
@@ -234,9 +225,7 @@ struct PlaneModel {
 impl PlaneModel {
     #[inline]
     fn distance(&self, point: &Point3<f32>) -> f32 {
-        self.normal
-            .dot(&(point.coords - self.center.coords))
-            .abs()
+        self.normal.dot(&(point.coords - self.center.coords)).abs()
     }
 }
 
@@ -311,10 +300,7 @@ struct FilterStats {
 
 impl FilterStats {
     fn kept_total(&self) -> usize {
-        self.kept_plane_inliers
-            + self.kept_sparse
-            + self.kept_nonplanar
-            + self.kept_fallback
+        self.kept_plane_inliers + self.kept_sparse + self.kept_nonplanar + self.kept_fallback
     }
 
     fn removed_total(&self) -> usize {
@@ -443,13 +429,19 @@ fn main() -> Result<()> {
     println!("Extracted local planes    : {}", stats.local_planes);
     println!("Consensus surface planes  : {}", stats.consensus_planes);
     println!("Own-reference cells       : {}", stats.own_reference_cells);
-    println!("Neighbor-reference cells  : {}", stats.neighbor_reference_cells);
+    println!(
+        "Neighbor-reference cells  : {}",
+        stats.neighbor_reference_cells
+    );
     println!("No-reference cells        : {}", stats.no_reference_cells);
     println!("Kept plane inliers        : {}", stats.kept_plane_inliers);
     println!("Kept sparse points        : {}", stats.kept_sparse);
     println!("Kept non-planar points    : {}", stats.kept_nonplanar);
     println!("Kept fallback points      : {}", stats.kept_fallback);
-    println!("Removed plane outliers    : {}", stats.removed_plane_outliers);
+    println!(
+        "Removed plane outliers    : {}",
+        stats.removed_plane_outliers
+    );
     println!("Removed non-planar points : {}", stats.removed_nonplanar);
     println!("Kept total                : {}", stats.kept_total());
     println!("Removed total             : {}", stats.removed_total());
@@ -524,20 +516,13 @@ fn filter_points(
     let plane_entries: Vec<(VoxelKey, PlaneCell)> = occupied_keys
         .par_iter()
         .map(|&key| {
-            let neighborhood =
-                collect_neighborhood_indices(grid, key, config.neighbor_range);
+            let neighborhood = collect_neighborhood_indices(grid, key, config.neighbor_range);
 
-            let primary_plane =
-                if neighborhood.len() >= config.min_neighbor_points {
-                    fit_plane_ransac(
-                        points,
-                        &neighborhood,
-                        config,
-                        seed_from_key(key, 0),
-                    )
-                } else {
-                    None
-                };
+            let primary_plane = if neighborhood.len() >= config.min_neighbor_points {
+                fit_plane_ransac(points, &neighborhood, config, seed_from_key(key, 0))
+            } else {
+                None
+            };
 
             (
                 key,
@@ -560,13 +545,11 @@ fn filter_points(
     let consensus_entries: Vec<(VoxelKey, PlaneModel)> = occupied_keys
         .par_iter()
         .filter_map(|&key| {
-            build_consensus_plane(key, &plane_grid, config)
-                .map(|plane| (key, plane))
+            build_consensus_plane(key, &plane_grid, config).map(|plane| (key, plane))
         })
         .collect();
 
-    let consensus_grid: ConsensusPlaneGrid =
-        consensus_entries.into_iter().collect();
+    let consensus_grid: ConsensusPlaneGrid = consensus_entries.into_iter().collect();
 
     // Pass 3:
     // 各セルについて候補代表平面を列挙するが、点ごとのOR判定は行わない。
@@ -574,14 +557,7 @@ fn filter_points(
     let cell_results: Vec<CellResult> = occupied_keys
         .par_iter()
         .map(|&key| {
-            classify_voxel_single_reference(
-                key,
-                points,
-                grid,
-                &plane_grid,
-                &consensus_grid,
-                config,
-            )
+            classify_voxel_single_reference(key, points, grid, &plane_grid, &consensus_grid, config)
         })
         .collect();
 
@@ -676,25 +652,17 @@ fn build_consensus_plane(
         return None;
     }
 
-    let normal_cos_threshold =
-        config.consensus_normal_angle_deg.to_radians().cos();
+    let normal_cos_threshold = config.consensus_normal_angle_deg.to_radians().cos();
 
     // 最も支持重みの大きい法線クラスタのアンカーを選択。
     let mut best_anchor_index = 0usize;
     let mut best_normal_score = f32::NEG_INFINITY;
 
-    for (candidate_index, &candidate) in
-        candidates.iter().enumerate()
-    {
+    for (candidate_index, &candidate) in candidates.iter().enumerate() {
         let mut score = 0.0f32;
 
         for &other in &candidates {
-            if candidate
-                .normal
-                .dot(&other.normal)
-                .abs()
-                >= normal_cos_threshold
-            {
+            if candidate.normal.dot(&other.normal).abs() >= normal_cos_threshold {
                 score += plane_quality_weight(other);
             }
         }
@@ -708,8 +676,7 @@ fn build_consensus_plane(
     let anchor_normal = candidates[best_anchor_index].normal;
 
     // アンカーと同じ向きの平面だけを集め、法線の符号をそろえる。
-    let mut normal_cluster: Vec<(&PlaneModel, Vector3<f32>, f32)> =
-        Vec::new();
+    let mut normal_cluster: Vec<(&PlaneModel, Vector3<f32>, f32)> = Vec::new();
 
     for plane in candidates {
         let dot = anchor_normal.dot(&plane.normal);
@@ -724,11 +691,7 @@ fn build_consensus_plane(
             plane.normal
         };
 
-        normal_cluster.push((
-            plane,
-            aligned_normal,
-            plane_quality_weight(plane),
-        ));
+        normal_cluster.push((plane, aligned_normal, plane_quality_weight(plane)));
     }
 
     if normal_cluster.len() < config.min_consensus_planes {
@@ -749,23 +712,19 @@ fn build_consensus_plane(
     let initial_normal = initial_normal_sum / initial_normal_norm;
 
     // 共通法線に沿った平面オフセット n·x を計算。
-    let mut offset_planes: Vec<(f32, f32, &PlaneModel, Vector3<f32>)> =
-        normal_cluster
-            .into_iter()
-            .map(|(plane, aligned_normal, weight)| {
-                (
-                    initial_normal.dot(&plane.center.coords),
-                    weight,
-                    plane,
-                    aligned_normal,
-                )
-            })
-            .collect();
+    let mut offset_planes: Vec<(f32, f32, &PlaneModel, Vector3<f32>)> = normal_cluster
+        .into_iter()
+        .map(|(plane, aligned_normal, weight)| {
+            (
+                initial_normal.dot(&plane.center.coords),
+                weight,
+                plane,
+                aligned_normal,
+            )
+        })
+        .collect();
 
-    offset_planes.sort_by(|a, b| {
-        a.0.partial_cmp(&b.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    offset_planes.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
     // 幅 parallel_plane_tolerance 内で支持重みが最大となる表面層を選択。
     let mut left = 0usize;
@@ -777,9 +736,7 @@ fn build_consensus_plane(
     for right in 0..offset_planes.len() {
         running_weight += offset_planes[right].1;
 
-        while offset_planes[right].0 - offset_planes[left].0
-            > config.parallel_plane_tolerance
-        {
+        while offset_planes[right].0 - offset_planes[left].0 > config.parallel_plane_tolerance {
             running_weight -= offset_planes[left].1;
             left += 1;
         }
@@ -787,9 +744,7 @@ fn build_consensus_plane(
         let count = right - left + 1;
         let best_count = best_right.saturating_sub(best_left) + 1;
 
-        if running_weight > best_weight
-            || (running_weight == best_weight && count > best_count)
-        {
+        if running_weight > best_weight || (running_weight == best_weight && count > best_count) {
             best_weight = running_weight;
             best_left = left;
             best_right = right;
@@ -824,20 +779,15 @@ fn build_consensus_plane(
 
     let final_offset = selected
         .iter()
-        .map(|(_, weight, plane, _)| {
-            final_normal.dot(&plane.center.coords) * *weight
-        })
+        .map(|(_, weight, plane, _)| final_normal.dot(&plane.center.coords) * *weight)
         .sum::<f32>()
         / total_weight;
 
     let cell_center = voxel_center_from_key(key, config.voxel_size);
 
-    let center_shift =
-        final_offset - final_normal.dot(&cell_center.coords);
+    let center_shift = final_offset - final_normal.dot(&cell_center.coords);
 
-    let final_center = Point3::from(
-        cell_center.coords + final_normal * center_shift,
-    );
+    let final_center = Point3::from(cell_center.coords + final_normal * center_shift);
 
     let lambda_min = selected
         .iter()
@@ -903,13 +853,7 @@ fn classify_voxel_single_reference(
     };
 
     let (reference_plane, reference_source) =
-        choose_single_reference_plane(
-            key,
-            current_indices,
-            points,
-            consensus_grid,
-            config,
-        );
+        choose_single_reference_plane(key, current_indices, points, consensus_grid, config);
 
     let Some(reference_plane) = reference_plane else {
         let neighborhood_count = raw_plane_grid
@@ -935,8 +879,7 @@ fn classify_voxel_single_reference(
         };
     };
 
-    let mut decisions: Vec<(usize, PointDecision)> =
-        Vec::with_capacity(current_indices.len());
+    let mut decisions: Vec<(usize, PointDecision)> = Vec::with_capacity(current_indices.len());
 
     let mut fallback_candidates: Vec<(f32, usize)> = Vec::new();
     let mut strict_keep_count = 0usize;
@@ -946,42 +889,27 @@ fn classify_voxel_single_reference(
 
         if distance <= config.keep_distance_threshold {
             strict_keep_count += 1;
-            decisions.push((
-                point_index,
-                PointDecision::KeepPlaneInlier,
-            ));
+            decisions.push((point_index, PointDecision::KeepPlaneInlier));
         } else {
             let decision_position = decisions.len();
 
-            decisions.push((
-                point_index,
-                PointDecision::RemovePlaneOutlier,
-            ));
+            decisions.push((point_index, PointDecision::RemovePlaneOutlier));
 
             if distance <= config.fallback_keep_distance {
-                fallback_candidates.push((
-                    distance,
-                    decision_position,
-                ));
+                fallback_candidates.push((distance, decision_position));
             }
         }
     }
 
     // セルの密度穴を防ぐ有限救済。
     if strict_keep_count < config.min_output_points_per_voxel {
-        fallback_candidates.sort_by(|a, b| {
-            a.0.partial_cmp(&b.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        fallback_candidates
+            .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
-        let rescue_count =
-            config.min_output_points_per_voxel - strict_keep_count;
+        let rescue_count = config.min_output_points_per_voxel - strict_keep_count;
 
-        for &(_, decision_position) in
-            fallback_candidates.iter().take(rescue_count)
-        {
-            decisions[decision_position].1 =
-                PointDecision::KeepFallback;
+        for &(_, decision_position) in fallback_candidates.iter().take(rescue_count) {
+            decisions[decision_position].1 = PointDecision::KeepFallback;
         }
     }
 
@@ -1015,24 +943,16 @@ fn choose_single_reference_plane<'a>(
     let mut best_plane_support = 0usize;
     let mut best_is_own = false;
 
-    for dz in -config.reference_plane_range
-        ..=config.reference_plane_range
-    {
-        for dy in -config.reference_plane_range
-            ..=config.reference_plane_range
-        {
-            for dx in -config.reference_plane_range
-                ..=config.reference_plane_range
-            {
+    for dz in -config.reference_plane_range..=config.reference_plane_range {
+        for dy in -config.reference_plane_range..=config.reference_plane_range {
+            for dx in -config.reference_plane_range..=config.reference_plane_range {
                 let candidate_key = VoxelKey {
                     ix: key.ix + dx,
                     iy: key.iy + dy,
                     iz: key.iz + dz,
                 };
 
-                let Some(candidate) =
-                    consensus_grid.get(&candidate_key)
-                else {
+                let Some(candidate) = consensus_grid.get(&candidate_key) else {
                     continue;
                 };
 
@@ -1040,8 +960,7 @@ fn choose_single_reference_plane<'a>(
                 let mut squared_error = 0.0f32;
 
                 for &point_index in current_indices {
-                    let distance =
-                        candidate.distance(&points[point_index]);
+                    let distance = candidate.distance(&points[point_index]);
 
                     if distance <= config.reference_support_distance {
                         support_count += 1;
@@ -1053,42 +972,21 @@ fn choose_single_reference_plane<'a>(
                     continue;
                 }
 
-                let mean_squared_error =
-                    squared_error / support_count as f32;
+                let mean_squared_error = squared_error / support_count as f32;
 
                 let is_own = candidate_key == key;
 
-                let better =
-                    support_count > best_support_count
-                    || (
-                        support_count == best_support_count
-                        && mean_squared_error
-                            < best_mean_squared_error
-                    )
-                    || (
-                        support_count == best_support_count
-                        && (
-                            mean_squared_error
-                                - best_mean_squared_error
-                        )
-                        .abs()
-                            <= 1.0e-12
-                        && candidate.inlier_count
-                            > best_plane_support
-                    )
-                    || (
-                        support_count == best_support_count
-                        && (
-                            mean_squared_error
-                                - best_mean_squared_error
-                        )
-                        .abs()
-                            <= 1.0e-12
-                        && candidate.inlier_count
-                            == best_plane_support
+                let better = support_count > best_support_count
+                    || (support_count == best_support_count
+                        && mean_squared_error < best_mean_squared_error)
+                    || (support_count == best_support_count
+                        && (mean_squared_error - best_mean_squared_error).abs() <= 1.0e-12
+                        && candidate.inlier_count > best_plane_support)
+                    || (support_count == best_support_count
+                        && (mean_squared_error - best_mean_squared_error).abs() <= 1.0e-12
+                        && candidate.inlier_count == best_plane_support
                         && is_own
-                        && !best_is_own
-                    );
+                        && !best_is_own);
 
                 if better {
                     best_plane = Some(candidate);
@@ -1110,10 +1008,7 @@ fn choose_single_reference_plane<'a>(
     // 将来の設定変更に対する安全策として保持。
     if best_plane.is_none() {
         if let Some(plane) = own_plane {
-            return (
-                Some(plane),
-                PlaneReferenceSource::OwnConsensus,
-            );
+            return (Some(plane), PlaneReferenceSource::OwnConsensus);
         }
     }
 
@@ -1122,20 +1017,15 @@ fn choose_single_reference_plane<'a>(
 
 #[inline]
 fn plane_quality_weight(plane: &PlaneModel) -> f32 {
-    let planarity_ratio =
-        plane.lambda_min / plane.lambda_mid.max(1.0e-12);
+    let planarity_ratio = plane.lambda_min / plane.lambda_mid.max(1.0e-12);
 
-    let planarity_quality =
-        (1.0 - planarity_ratio).clamp(0.05, 1.0);
+    let planarity_quality = (1.0 - planarity_ratio).clamp(0.05, 1.0);
 
     plane.inlier_count.max(1) as f32 * planarity_quality
 }
 
 #[inline]
-fn voxel_center_from_key(
-    key: VoxelKey,
-    voxel_size: f32,
-) -> Point3<f32> {
+fn voxel_center_from_key(key: VoxelKey, voxel_size: f32) -> Point3<f32> {
     Point3::new(
         (key.ix as f32 + 0.5) * voxel_size,
         (key.iy as f32 + 0.5) * voxel_size,
@@ -1143,11 +1033,7 @@ fn voxel_center_from_key(
     )
 }
 
-fn collect_neighborhood_indices(
-    grid: &VoxelGrid,
-    center: VoxelKey,
-    range: i32,
-) -> Vec<usize> {
+fn collect_neighborhood_indices(grid: &VoxelGrid, center: VoxelKey, range: i32) -> Vec<usize> {
     let side = (2 * range + 1).max(1) as usize;
     let mut result = Vec::with_capacity(side * side * side * 4);
 
@@ -1190,8 +1076,7 @@ fn fit_plane_ransac(
     let mut best_squared_error = f32::INFINITY;
 
     for _ in 0..config.max_iterations {
-        let (i0, i1, i2) =
-            sample_three_unique(&mut rng, candidate_indices.len());
+        let (i0, i1, i2) = sample_three_unique(&mut rng, candidate_indices.len());
 
         let p0 = points[candidate_indices[i0]];
         let p1 = points[candidate_indices[i1]];
@@ -1212,9 +1097,7 @@ fn fit_plane_ransac(
         let mut squared_error = 0.0f32;
 
         for &index in candidate_indices {
-            let distance = normal
-                .dot(&(points[index].coords - p0.coords))
-                .abs();
+            let distance = normal.dot(&(points[index].coords - p0.coords)).abs();
 
             if distance <= config.fit_distance_threshold {
                 inlier_count += 1;
@@ -1223,8 +1106,7 @@ fn fit_plane_ransac(
         }
 
         let is_better = inlier_count > best_inlier_count
-            || (inlier_count == best_inlier_count
-                && squared_error < best_squared_error);
+            || (inlier_count == best_inlier_count && squared_error < best_squared_error);
 
         if is_better {
             best_normal = normal;
@@ -1238,8 +1120,7 @@ fn fit_plane_ransac(
         return None;
     }
 
-    let rough_ratio =
-        best_inlier_count as f32 / candidate_indices.len() as f32;
+    let rough_ratio = best_inlier_count as f32 / candidate_indices.len() as f32;
 
     if rough_ratio < config.min_inlier_ratio {
         return None;
@@ -1250,13 +1131,8 @@ fn fit_plane_ransac(
     //
     // そこで粗いRANSAC法線に沿った符号付き残差をヒストグラム化し、
     // 最も点数の多い表面層を選んでPCA再フィットする。
-    let mode_origin = find_dominant_residual_layer(
-        points,
-        candidate_indices,
-        best_origin,
-        best_normal,
-        config,
-    )?;
+    let mode_origin =
+        find_dominant_residual_layer(points, candidate_indices, best_origin, best_normal, config)?;
 
     let first_refit_indices: Vec<usize> = candidate_indices
         .iter()
@@ -1279,10 +1155,7 @@ fn fit_plane_ransac(
     let final_indices: Vec<usize> = candidate_indices
         .iter()
         .copied()
-        .filter(|&index| {
-            first_refined.distance(&points[index])
-                <= config.refit_distance_threshold
-        })
+        .filter(|&index| first_refined.distance(&points[index]) <= config.refit_distance_threshold)
         .collect();
 
     if final_indices.len() < config.min_inliers {
@@ -1294,9 +1167,7 @@ fn fit_plane_ransac(
     let denominator = final_plane.lambda_mid.max(1.0e-12);
     let planarity_ratio = final_plane.lambda_min / denominator;
 
-    if !planarity_ratio.is_finite()
-        || planarity_ratio > config.max_planarity_ratio
-    {
+    if !planarity_ratio.is_finite() || planarity_ratio > config.max_planarity_ratio {
         return None;
     }
 
@@ -1319,28 +1190,22 @@ fn find_dominant_residual_layer(
     config: &FilterConfig,
 ) -> Option<Point3<f32>> {
     let total_width = 2.0 * config.fit_distance_threshold;
-    let bin_count = (total_width / config.residual_bin_size)
-        .ceil()
-        .max(1.0) as usize
-        + 1;
+    let bin_count = (total_width / config.residual_bin_size).ceil().max(1.0) as usize + 1;
 
     let mut counts = vec![0usize; bin_count];
     let mut sums = vec![0.0f32; bin_count];
 
     for &index in candidate_indices {
-        let signed_distance = rough_normal
-            .dot(&(points[index].coords - rough_origin.coords));
+        let signed_distance = rough_normal.dot(&(points[index].coords - rough_origin.coords));
 
         if signed_distance.abs() > config.fit_distance_threshold {
             continue;
         }
 
         let normalized =
-            (signed_distance + config.fit_distance_threshold)
-                / config.residual_bin_size;
+            (signed_distance + config.fit_distance_threshold) / config.residual_bin_size;
 
-        let bin = (normalized.floor() as isize)
-            .clamp(0, bin_count as isize - 1) as usize;
+        let bin = (normalized.floor() as isize).clamp(0, bin_count as isize - 1) as usize;
 
         counts[bin] += 1;
         sums[bin] += signed_distance;
@@ -1352,14 +1217,10 @@ fn find_dominant_residual_layer(
         .max_by(|(index_a, count_a), (index_b, count_b)| {
             count_a.cmp(count_b).then_with(|| {
                 // 同数なら粗いRANSAC平面に近い層を優先。
-                let center_a = (
-                    *index_a as f32 + 0.5
-                ) * config.residual_bin_size
+                let center_a = (*index_a as f32 + 0.5) * config.residual_bin_size
                     - config.fit_distance_threshold;
 
-                let center_b = (
-                    *index_b as f32 + 0.5
-                ) * config.residual_bin_size
+                let center_b = (*index_b as f32 + 0.5) * config.residual_bin_size
                     - config.fit_distance_threshold;
 
                 center_b
@@ -1374,18 +1235,14 @@ fn find_dominant_residual_layer(
         return None;
     }
 
-    let mode_signed_distance =
-        sums[best_bin] / counts[best_bin] as f32;
+    let mode_signed_distance = sums[best_bin] / counts[best_bin] as f32;
 
     Some(Point3::from(
         rough_origin.coords + rough_normal * mode_signed_distance,
     ))
 }
 
-fn fit_plane_pca(
-    points: &[Point3<f32>],
-    indices: &[usize],
-) -> Option<PlaneModel> {
+fn fit_plane_pca(points: &[Point3<f32>], indices: &[usize]) -> Option<PlaneModel> {
     if indices.len() < 3 {
         return None;
     }
@@ -1440,10 +1297,7 @@ fn fit_plane_pca(
     })
 }
 
-fn sample_three_unique(
-    rng: &mut XorShift64,
-    length: usize,
-) -> (usize, usize, usize) {
+fn sample_three_unique(rng: &mut XorShift64, length: usize) -> (usize, usize, usize) {
     debug_assert!(length >= 3);
 
     let i0 = rng.index(length);
@@ -1487,7 +1341,11 @@ fn parse_args() -> Result<CliArgs> {
     }
 
     if args.len() < 3 {
-        print_usage(args.first().map(String::as_str).unwrap_or("filter_world_map_ransac"));
+        print_usage(
+            args.first()
+                .map(String::as_str)
+                .unwrap_or("filter_world_map_ransac"),
+        );
         bail!("Input and output PCD paths are required");
     }
 
@@ -1505,14 +1363,12 @@ fn parse_args() -> Result<CliArgs> {
                 config.voxel_size = parse_next::<f32>(&args, &mut index, "--voxel-size")?;
             }
             "--neighbor-range" => {
-                config.neighbor_range =
-                    parse_next::<i32>(&args, &mut index, "--neighbor-range")?;
+                config.neighbor_range = parse_next::<i32>(&args, &mut index, "--neighbor-range")?;
             }
             // 後方互換: 両方を同じ値に設定する。
             // 太い壁を薄くする用途では、下の2オプションを個別指定する方がよい。
             "--distance-threshold" => {
-                let value =
-                    parse_next::<f32>(&args, &mut index, "--distance-threshold")?;
+                let value = parse_next::<f32>(&args, &mut index, "--distance-threshold")?;
                 config.fit_distance_threshold = value;
                 config.refit_distance_threshold = value;
                 config.keep_distance_threshold = value;
@@ -1570,16 +1426,14 @@ fn parse_args() -> Result<CliArgs> {
                     parse_next::<f32>(&args, &mut index, "--fallback-keep-distance")?;
             }
             "--iterations" => {
-                config.max_iterations =
-                    parse_next::<usize>(&args, &mut index, "--iterations")?;
+                config.max_iterations = parse_next::<usize>(&args, &mut index, "--iterations")?;
             }
             "--min-neighbors" => {
                 config.min_neighbor_points =
                     parse_next::<usize>(&args, &mut index, "--min-neighbors")?;
             }
             "--min-inliers" => {
-                config.min_inliers =
-                    parse_next::<usize>(&args, &mut index, "--min-inliers")?;
+                config.min_inliers = parse_next::<usize>(&args, &mut index, "--min-inliers")?;
             }
             "--min-inlier-ratio" => {
                 config.min_inlier_ratio =
@@ -1594,12 +1448,9 @@ fn parse_args() -> Result<CliArgs> {
                     parse_next::<f32>(&args, &mut index, "--min-planar-spread")?;
             }
             "--max-planes" => {
-                let value =
-                    parse_next::<usize>(&args, &mut index, "--max-planes")?;
+                let value = parse_next::<usize>(&args, &mut index, "--max-planes")?;
                 if value != 1 {
-                    bail!(
-                        "v4 stores one dominant plane per filter cell; --max-planes must be 1"
-                    );
+                    bail!("v4 stores one dominant plane per filter cell; --max-planes must be 1");
                 }
             }
             "--removed-output" => {
@@ -1632,11 +1483,7 @@ fn parse_args() -> Result<CliArgs> {
     })
 }
 
-fn parse_next<T>(
-    args: &[String],
-    index: &mut usize,
-    option_name: &str,
-) -> Result<T>
+fn parse_next<T>(args: &[String], index: &mut usize, option_name: &str) -> Result<T>
 where
     T: std::str::FromStr,
     T::Err: std::fmt::Display,
@@ -1661,45 +1508,31 @@ fn validate_config(config: &FilterConfig) -> Result<()> {
         bail!("neighbor_range must be >= 0");
     }
 
-    if !config.fit_distance_threshold.is_finite()
-        || config.fit_distance_threshold <= 0.0
-    {
+    if !config.fit_distance_threshold.is_finite() || config.fit_distance_threshold <= 0.0 {
         bail!("fit_distance_threshold must be finite and > 0");
     }
 
-    if !config.keep_distance_threshold.is_finite()
-        || config.keep_distance_threshold <= 0.0
-    {
+    if !config.keep_distance_threshold.is_finite() || config.keep_distance_threshold <= 0.0 {
         bail!("keep_distance_threshold must be finite and > 0");
     }
 
     if config.keep_distance_threshold > config.fit_distance_threshold {
-        bail!(
-            "keep_distance_threshold must be <= fit_distance_threshold"
-        );
+        bail!("keep_distance_threshold must be <= fit_distance_threshold");
     }
 
-    if !config.refit_distance_threshold.is_finite()
-        || config.refit_distance_threshold <= 0.0
-    {
+    if !config.refit_distance_threshold.is_finite() || config.refit_distance_threshold <= 0.0 {
         bail!("refit_distance_threshold must be finite and > 0");
     }
 
     if config.refit_distance_threshold > config.fit_distance_threshold {
-        bail!(
-            "refit_distance_threshold must be <= fit_distance_threshold"
-        );
+        bail!("refit_distance_threshold must be <= fit_distance_threshold");
     }
 
     if config.keep_distance_threshold > config.refit_distance_threshold {
-        bail!(
-            "keep_distance_threshold must be <= refit_distance_threshold"
-        );
+        bail!("keep_distance_threshold must be <= refit_distance_threshold");
     }
 
-    if !config.residual_bin_size.is_finite()
-        || config.residual_bin_size <= 0.0
-    {
+    if !config.residual_bin_size.is_finite() || config.residual_bin_size <= 0.0 {
         bail!("residual_bin_size must be finite and > 0");
     }
 
@@ -1707,9 +1540,7 @@ fn validate_config(config: &FilterConfig) -> Result<()> {
         bail!("plane_vote_range must be >= 0");
     }
 
-    if !config.parallel_plane_tolerance.is_finite()
-        || config.parallel_plane_tolerance < 0.0
-    {
+    if !config.parallel_plane_tolerance.is_finite() || config.parallel_plane_tolerance < 0.0 {
         bail!("parallel_plane_tolerance must be finite and >= 0");
     }
 
@@ -1733,18 +1564,14 @@ fn validate_config(config: &FilterConfig) -> Result<()> {
         bail!("reference_plane_range must be >= 0");
     }
 
-    if !config.reference_support_distance.is_finite()
-        || config.reference_support_distance <= 0.0
-    {
+    if !config.reference_support_distance.is_finite() || config.reference_support_distance <= 0.0 {
         bail!("reference_support_distance must be finite and > 0");
     }
 
     if !config.fallback_keep_distance.is_finite()
         || config.fallback_keep_distance < config.keep_distance_threshold
     {
-        bail!(
-            "fallback_keep_distance must be finite and >= keep_distance_threshold"
-        );
+        bail!("fallback_keep_distance must be finite and >= keep_distance_threshold");
     }
 
     if config.max_iterations == 0 {
@@ -1767,15 +1594,11 @@ fn validate_config(config: &FilterConfig) -> Result<()> {
         bail!("min_inlier_ratio must be in [0, 1]");
     }
 
-    if !config.max_planarity_ratio.is_finite()
-        || config.max_planarity_ratio < 0.0
-    {
+    if !config.max_planarity_ratio.is_finite() || config.max_planarity_ratio < 0.0 {
         bail!("max_planarity_ratio must be finite and >= 0");
     }
 
-    if !config.min_planar_spread.is_finite()
-        || config.min_planar_spread < 0.0
-    {
+    if !config.min_planar_spread.is_finite() || config.min_planar_spread < 0.0 {
         bail!("min_planar_spread must be finite and >= 0");
     }
 

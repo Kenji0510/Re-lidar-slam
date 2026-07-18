@@ -26,7 +26,7 @@ const IMU_TO_LIDAR_QUAT_Z: f64 = -0.00246579;
 const IMU_TO_LIDAR_QUAT_W: f64 = 0.00097028;
 
 const DOWNSAMPLE_VOXEL_SIZE: f32 = 0.25; // m
-const LOCAL_MAP_VOXEL_SIZE: f32 = 0.25; // m
+const LOCAL_MAP_VOXEL_SIZE: f32 = 0.4; // m
 const GLOBAL_MAP_VOXEL_SIZE: f32 = 0.1; // m
 
 const NEIGHBOR_RANGE: i32 = 2; // Voxel search range for nearest neighbor search
@@ -336,7 +336,11 @@ fn main() -> Result<()> {
             frame_index: i,
             timestamp: current_frame_start_time,
             icp_ok,
-            rmse: if prev_rmse.is_finite() { Some(prev_rmse) } else { None },
+            rmse: if prev_rmse.is_finite() {
+                Some(prev_rmse)
+            } else {
+                None
+            },
             translation_m,
             rotation_deg,
             velocity_m_s: new_velocity.norm(),
