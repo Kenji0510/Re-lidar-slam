@@ -43,11 +43,20 @@ pub fn check_points_on_plane(
     normal: &Vector3<f32>,
     d: f32,
     points: &[Point3<f32>],
-    threshold: f32,
+    plane_point_distance_threshold_m: f32,
 ) -> bool {
-    points
-        .iter()
-        .all(|p| (normal.dot(&p.coords) + d).abs() < threshold)
+    if points.len() < 3
+        || !plane_point_distance_threshold_m.is_finite()
+        || plane_point_distance_threshold_m <= 0.0
+    {
+        return false;
+    }
+
+    points.iter().all(|p| {
+        let point_to_plane_distance = (normal.dot(&p.coords) + d).abs();
+
+        point_to_plane_distance <= plane_point_distance_threshold_m
+    })
 }
 
 /// Fast-LIO2 スタイルの「source 点が平面に十分近いか」判定。
@@ -63,7 +72,7 @@ pub fn check_source_on_plane(
     d: f32,
     world_point: &Point3<f32>,
     sensor_dist: f32,
-    plane_fit_threshold: f32
+    plane_fit_threshold: f32,
 ) -> bool {
     let pd2 = normal.dot(&world_point.coords) + d;
     let s = 1.0 - 0.9 * pd2.abs() / sensor_dist.sqrt().max(1e-6);
@@ -147,7 +156,8 @@ pub fn pickup_valid_source_points<'a>(
     search_range: i32,
     k: usize,
     max_dist_factor: f32,
-    plane_fit_threshold: f32,
+    plane_point_distance_threshold: f32,
+    source_plane_score_threshold: f32,
     r_mat: &Matrix3<f32>,
     t_vec: &Vector3<f32>,
 ) -> Vec<PointCorrespondence<'a>> {
@@ -188,13 +198,13 @@ pub fn pickup_valid_source_points<'a>(
 
             let (normal, d) = fit_plane(&neighbor_points)?;
 
-            if !check_points_on_plane(&normal, d, &neighbor_points, plane_fit_threshold) {
+            if !check_points_on_plane(&normal, d, &neighbor_points, plane_point_distance_threshold) {
                 return None;
             }
 
             // センサ原点からの距離でスケールした閾値（ローカル座標の norm を使用）
             let sensor_dist = src_point.coords.norm();
-            if !check_source_on_plane(&normal, d, &query_point, sensor_dist, plane_fit_threshold) {
+            if !check_source_on_plane(&normal, d, &query_point, sensor_dist, source_plane_score_threshold) {
                 return None;
             }
 

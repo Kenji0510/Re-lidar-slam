@@ -11,8 +11,8 @@ fn main() -> Result<()> {
 
     let json_str = std::fs::read_to_string(&json_path)
         .with_context(|| format!("Cannot read: {}", json_path))?;
-    let logs: Vec<FrameLog> = serde_json::from_str(&json_str)
-        .context("Failed to parse frame_logs.json")?;
+    let logs: Vec<FrameLog> =
+        serde_json::from_str(&json_str).context("Failed to parse frame_logs.json")?;
 
     println!("Loaded {} frames from {}", logs.len(), json_path);
 
@@ -102,10 +102,7 @@ fn draw_line_panel(
         .iter()
         .map(|&(_, v)| v)
         .fold(f32::NEG_INFINITY, f32::max);
-    let y_min = data
-        .iter()
-        .map(|&(_, v)| v)
-        .fold(f32::INFINITY, f32::min);
+    let y_min = data.iter().map(|&(_, v)| v).fold(f32::INFINITY, f32::min);
     let y_range = (y_max - y_min).max(1e-6);
     let y_lo = (y_min - y_range * 0.05).min(0.0);
     let y_hi = y_max + y_range * 0.05;
@@ -166,30 +163,34 @@ fn plot_trajectory_xy(logs: &[FrameLog], out_dir: &str) -> Result<()> {
 
     // Trajectory line
     chart.draw_series(LineSeries::new(
-        xs.iter().zip(ys.iter()).map(|(&x, &y)| (x as f32, y as f32)),
+        xs.iter()
+            .zip(ys.iter())
+            .map(|(&x, &y)| (x as f32, y as f32)),
         BLUE.stroke_width(1),
     ))?;
 
     // Start marker (green circle)
     if let (Some(&sx), Some(&sy)) = (xs.first(), ys.first()) {
-        chart.draw_series(std::iter::once(Circle::new(
-            (sx as f32, sy as f32),
-            6,
-            GREEN.filled(),
-        )))?
-        .label("Start")
-        .legend(|(x, y)| Circle::new((x, y), 5, GREEN.filled()));
+        chart
+            .draw_series(std::iter::once(Circle::new(
+                (sx as f32, sy as f32),
+                6,
+                GREEN.filled(),
+            )))?
+            .label("Start")
+            .legend(|(x, y)| Circle::new((x, y), 5, GREEN.filled()));
     }
 
     // End marker (red circle)
     if let (Some(&ex), Some(&ey)) = (xs.last(), ys.last()) {
-        chart.draw_series(std::iter::once(Circle::new(
-            (ex as f32, ey as f32),
-            6,
-            RED.filled(),
-        )))?
-        .label("End")
-        .legend(|(x, y)| Circle::new((x, y), 5, RED.filled()));
+        chart
+            .draw_series(std::iter::once(Circle::new(
+                (ex as f32, ey as f32),
+                6,
+                RED.filled(),
+            )))?
+            .label("End")
+            .legend(|(x, y)| Circle::new((x, y), 5, RED.filled()));
     }
 
     chart

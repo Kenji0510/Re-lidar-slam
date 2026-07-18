@@ -11,8 +11,8 @@ use re_lidar_slam::{
     voxelization::voxel_downsample_points,
 };
 
-const LOAD_DIR: &str = "/home/kenji/mnt/nfs/share/airy96/07112026/park06";
-const SAVE_DIR: &str = "data/output/debug/07112026";
+const LOAD_DIR: &str = "data/input/06212026/park05";
+const SAVE_DIR: &str = "data/output/debug/07182026";
 
 const MIN_DIST: f32 = 0.5;
 const MAX_DIST: f32 = 40.0;
@@ -34,9 +34,11 @@ const NEIGHBOR_RANGE: i32 = 2; // Voxel search range for nearest neighbor search
 const KNN_K: usize = 5; // Number of nearest neighbors for plane fitting
 const SEARCH_RANGE: i32 = 2; // Voxel search range for nearest neighbor search
 const MAX_DIST_FACTOR: f32 = 2.5; // Maximum distance factor for nearest neighbor search (Prev: 3.0)
-const PLANE_FIT_THRESHOLD_FOR_LOCAL: f32 = 0.75; // Threshold for plane fitting (Fast-LIO2 基準 s > 0.9)
-const PLANE_FIT_THRESHOLD_FOR_GLOBAL: f32 = 0.75; // Threshold for plane fitting (Fast-LIO2 基準 s > 0.9)
-const MAX_POINTS_PER_VOXEL: usize = 8; // Max points collected per voxel (for covariance)
+// k近傍点が推定平面から離れてよい最大距離 [m]
+const LOCAL_PLANE_POINT_DISTANCE_THRESHOLD_M: f32 = 0.1;
+const GLOBAL_PLANE_POINT_DISTANCE_THRESHOLD_M: f32 = 0.1;
+const LOCAL_SOURCE_PLANE_SCORE_THRESHOLD: f32 = 0.90;
+const GLOBAL_SOURCE_PLANE_SCORE_THRESHOLD: f32 = 0.90;
 
 const ICP_ITERATIONS: usize = 5; // Default: 5
 const ICP_RMSE_THRESHOLD: f32 = 0.077; // 収束判定: RMSE の変化量がこれ以下なら停止 // voxel size 0.2m の場合、0.07m くらいが妥当
@@ -188,6 +190,12 @@ fn main() -> Result<()> {
             NEIGHBOR_RANGE,
             false,
         );
+        let source_voxel_map_for_global = build_voxel_map(
+            &downsampled_source_points_for_global,
+            GLOBAL_MAP_VOXEL_SIZE,
+            NEIGHBOR_RANGE,
+            false,
+        );
         let build_map_end = build_map_start.elapsed();
         log::debug!("Frame {i}: Built voxel map in {:.2?}", build_map_end);
         // --- Build voxel map for source points ---
@@ -218,7 +226,8 @@ fn main() -> Result<()> {
                     SEARCH_RANGE,
                     KNN_K,
                     MAX_DIST_FACTOR,
-                    PLANE_FIT_THRESHOLD_FOR_LOCAL,
+                    LOCAL_PLANE_POINT_DISTANCE_THRESHOLD_M,
+                    LOCAL_SOURCE_PLANE_SCORE_THRESHOLD,
                     &r_mat,
                     &t_vec,
                 );
@@ -330,7 +339,11 @@ fn main() -> Result<()> {
             frame_index: i,
             timestamp: current_frame_start_time,
             icp_ok,
-            rmse: if prev_rmse.is_finite() { Some(prev_rmse) } else { None },
+            rmse: if prev_rmse.is_finite() {
+                Some(prev_rmse)
+            } else {
+                None
+            },
             translation_m,
             rotation_deg,
             velocity_m_s: new_velocity.norm(),
@@ -356,20 +369,21 @@ fn main() -> Result<()> {
                 downsampled_source_points_for_global.clone()
             } else {
                 let valid = pickup_valid_source_points(
-                    &source_voxel_map,
+                    &source_voxel_map_for_global,
                     &slam_map.local_voxel_map.voxel_map,
                     slam_map.local_voxel_map.config.index_voxel_size,
                     SEARCH_RANGE,
                     KNN_K,
                     MAX_DIST_FACTOR,
-                    PLANE_FIT_THRESHOLD_FOR_GLOBAL,
+                    GLOBAL_PLANE_POINT_DISTANCE_THRESHOLD_M,
+                    GLOBAL_SOURCE_PLANE_SCORE_THRESHOLD,
                     &r_mat,
                     &t_vec,
                 );
                 log::debug!(
                     "Frame {i}: {} / {} source points passed plane filter for global map",
                     valid.len(),
-                    source_voxel_map.len(),
+                    source_voxel_map_for_global.len(),
                 );
                 valid.into_iter().map(|c| c.src_point).collect()
             };
