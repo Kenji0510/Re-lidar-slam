@@ -353,13 +353,6 @@ fn main() -> Result<()> {
         });
         // --- Record frame log ---
 
-        // --- Update the LocalMap with the new frame's points ---
-        slam_map.local_voxel_map.update_with_new_frame(
-            &downsampled_source_points_for_local,
-            &current_frame_info.current_global_pose,
-        );
-        // --- Update the LocalMap with the new frame's points ---
-
         // --- Filter valid source points, then update the WorldMap ---
         // ローカルマップが空（初回フレーム）の場合はフィルタなしで全点追加。
         // それ以外は pickup_valid_source_points で平面に乗っている点だけ抽出し、
@@ -392,6 +385,13 @@ fn main() -> Result<()> {
             &current_frame_info.current_global_pose,
         );
         // --- Filter valid source points, then update the WorldMap ---
+
+        // --- Update the LocalMap with the new frame's points ---
+        slam_map.local_voxel_map.update_with_new_frame(
+            &downsampled_source_points_for_local,
+            &current_frame_info.current_global_pose,
+        );
+        // --- Update the LocalMap with the new frame's points ---
 
         prev_frame_start_time = current_frame_start_time;
     }
