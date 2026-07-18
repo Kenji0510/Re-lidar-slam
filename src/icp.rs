@@ -61,7 +61,8 @@ pub fn build_point_to_plane_system(
                     corr.target_cell.mean
                 };
 
-                let residual = corr.plane_normal.dot(&(transformed - target_pt.coords));
+                // let residual = corr.plane_normal.dot(&(transformed - target_pt.coords));
+                let residual = corr.plane_normal.dot(&transformed) + corr.plane_d;
 
                 let j_rot = rp.cross(&corr.plane_normal);
                 let j_trans = corr.plane_normal;
@@ -157,7 +158,8 @@ pub fn compute_rmse(
                 corr.target_cell.mean
             };
             let transformed = r_mat * corr.src_point.coords + t_vec;
-            let e = corr.plane_normal.dot(&(transformed - target_pt.coords));
+            // let e = corr.plane_normal.dot(&(transformed - target_pt.coords));
+            let e = corr.plane_normal.dot(&transformed) + corr.plane_d;
             e * e
         })
         .sum();
