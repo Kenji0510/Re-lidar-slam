@@ -59,14 +59,31 @@ pub fn check_points_on_plane(
     })
 }
 
-/// Fast-LIO2 スタイルの「source 点が平面に十分近いか」判定。
-///
-/// ```text
-/// pd2 = normal·world_point + d        (ワールド座標での符号付き距離)
-/// s   = 1 - 0.9 * |pd2| / sqrt(sensor_dist)
-/// 有効: s > 0.9
-/// ```
-/// `sensor_dist`: センサ原点からの距離 (= src_point.coords.norm())
+// Source点と推定平面との絶対距離を判定する。
+pub fn check_source_to_plane_absolute_distance(
+    normal: &Vector3<f32>,
+    d: f32,
+    world_point: &Point3<f32>,
+    max_distance_m: f32,
+) -> bool {
+    if !max_distance_m.is_finite() || max_distance_m <= 0.0 {
+        return false;
+    }
+
+    let point_to_plane_distance =
+        (normal.dot(&world_point.coords) + d).abs();
+
+    point_to_plane_distance <= max_distance_m
+}
+
+// Fast-LIO2 スタイルの「source 点が平面に十分近いか」判定。
+//
+// ```text
+// pd2 = normal·world_point + d        (ワールド座標での符号付き距離)
+// s   = 1 - 0.9 * |pd2| / sqrt(sensor_dist)
+// 有効: s > 0.9
+// ```
+// `sensor_dist`: センサ原点からの距離 (= src_point.coords.norm())
 pub fn check_source_on_plane(
     normal: &Vector3<f32>,
     d: f32,
@@ -158,6 +175,7 @@ pub fn pickup_valid_source_points<'a>(
     max_dist_factor: f32,
     plane_point_distance_threshold: f32,
     source_plane_score_threshold: f32,
+    source_to_plane_max_distance_m: Option<f32>,
     r_mat: &Matrix3<f32>,
     t_vec: &Vector3<f32>,
 ) -> Vec<PointCorrespondence<'a>> {
@@ -200,6 +218,17 @@ pub fn pickup_valid_source_points<'a>(
 
             if !check_points_on_plane(&normal, d, &neighbor_points, plane_point_distance_threshold) {
                 return None;
+            }
+
+            if let Some(max_distance_m) = source_to_plane_max_distance_m {
+                if !check_source_to_plane_absolute_distance(
+                    &normal,
+                    d,
+                    &query_point,
+                    max_distance_m,
+                ) {
+                    return None;
+                }
             }
 
             // センサ原点からの距離でスケールした閾値（ローカル座標の norm を使用）

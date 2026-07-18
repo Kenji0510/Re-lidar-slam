@@ -11,7 +11,7 @@ use re_lidar_slam::{
     voxelization::voxel_downsample_points,
 };
 
-const LOAD_DIR: &str = "data/input/06212026/park05";
+const LOAD_DIR: &str = "data/input/05162026/outdoor01";
 const SAVE_DIR: &str = "data/output/debug/07182026";
 
 const MIN_DIST: f32 = 0.5;
@@ -39,6 +39,8 @@ const LOCAL_PLANE_POINT_DISTANCE_THRESHOLD_M: f32 = 0.1;
 const GLOBAL_PLANE_POINT_DISTANCE_THRESHOLD_M: f32 = 0.1;
 const LOCAL_SOURCE_PLANE_SCORE_THRESHOLD: f32 = 0.90;
 const GLOBAL_SOURCE_PLANE_SCORE_THRESHOLD: f32 = 0.90;
+// GlobalMapへ追加するSource点と既存平面との最大距離 [m]
+const GLOBAL_SOURCE_TO_PLANE_MAX_DISTANCE_M: f32 = 0.08;
 
 const ICP_ITERATIONS: usize = 5; // Default: 5
 const ICP_RMSE_THRESHOLD: f32 = 0.077; // 収束判定: RMSE の変化量がこれ以下なら停止 // voxel size 0.2m の場合、0.07m くらいが妥当
@@ -228,6 +230,7 @@ fn main() -> Result<()> {
                     MAX_DIST_FACTOR,
                     LOCAL_PLANE_POINT_DISTANCE_THRESHOLD_M,
                     LOCAL_SOURCE_PLANE_SCORE_THRESHOLD,
+                    None,
                     &r_mat,
                     &t_vec,
                 );
@@ -370,6 +373,7 @@ fn main() -> Result<()> {
                     MAX_DIST_FACTOR,
                     GLOBAL_PLANE_POINT_DISTANCE_THRESHOLD_M,
                     GLOBAL_SOURCE_PLANE_SCORE_THRESHOLD,
+                    Some(GLOBAL_SOURCE_TO_PLANE_MAX_DISTANCE_M),
                     &r_mat,
                     &t_vec,
                 );
