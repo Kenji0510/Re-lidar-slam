@@ -3,6 +3,40 @@ use rayon::prelude::*;
 
 use crate::voxel_map::{VoxelCell, VoxelKey, VoxelMap, voxel_key};
 
+#[derive(Debug, Clone)]
+pub struct PlaneFit {
+    pub normal: Vector3<f32>,
+    pub d: f32,
+
+    pub eigenvalues: Vector3<f32>,
+}
+
+impl PlaneFit {
+    // 平面: 1に近い
+    // 線・縮退形状: 0に近い
+    pub fn planarity(&self) -> f32 {
+        let lambda0 = self.eigenvalues.x;
+        let lambda1 = self.eigenvalues.y;
+        let lambda2 = self.eigenvalues.z;
+
+        if !lambda2.is_finite() || lambda2 <= 1e-9 {
+            return 0.0;
+        }
+
+        ((lambda1 - lambda0) / lambda2).clamp(0.0, 1.0)
+    }
+
+    pub fn surface_variation(&self) -> f32 {
+        let sum = self.eigenvalues.sum();
+
+        if !sum.is_finite() || sum <= 1e-9 {
+            return 1.0;
+        }
+
+        (self.eigenvalues.x / sum).clamp(0.0, 1.0)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 平面フィッティング
 // ---------------------------------------------------------------------------
@@ -10,31 +44,92 @@ use crate::voxel_map::{VoxelCell, VoxelKey, VoxelMap, voxel_key};
 /// k 点から最小二乗平面 `normal·p + d = 0` を PCA（共分散行列の固有値分解）で求める。
 /// 返り値: (正規化済み法線, d)
 /// 3 点未満の場合は None。
-pub fn fit_plane(points: &[Point3<f32>]) -> Option<(Vector3<f32>, f32)> {
+// pub fn fit_plane(points: &[Point3<f32>]) -> Option<(Vector3<f32>, f32)> {
+//     if points.len() < 3 {
+//         return None;
+//     }
+
+//     // 重心
+//     let centroid = points
+//         .iter()
+//         .fold(Vector3::zeros(), |acc, p| acc + p.coords)
+//         / points.len() as f32;
+
+//     // 共分散行列
+//     let mut cov = Matrix3::<f32>::zeros();
+//     for p in points {
+//         let d = p.coords - centroid;
+//         cov += d * d.transpose();
+//     }
+
+//     // 固有値分解 — 最小固有値に対応する固有ベクトルが法線
+//     let eigen = cov.symmetric_eigen();
+//     let min_idx = eigen.eigenvalues.imin();
+//     let normal: Vector3<f32> = eigen.eigenvectors.column(min_idx).into_owned();
+//     let d = -normal.dot(&centroid);
+
+//     Some((normal, d))
+// }
+
+pub fn fit_plane(points: &[Point3<f32>]) -> Option<PlaneFit> {
     if points.len() < 3 {
         return None;
     }
+
+    if points
+        .iter()
+        .any(|p| p.coords.iter().any(|v| !v.is_finite()))
+    {
+        return None;
+    }
+
+    let point_count = points.len() as f32;
 
     // 重心
     let centroid = points
         .iter()
         .fold(Vector3::zeros(), |acc, p| acc + p.coords)
-        / points.len() as f32;
+        / point_count;
 
     // 共分散行列
     let mut cov = Matrix3::<f32>::zeros();
+
     for p in points {
-        let d = p.coords - centroid;
-        cov += d * d.transpose();
+        let diff = p.coords - centroid;
+        cov += diff * diff.transpose();
     }
 
-    // 固有値分解 — 最小固有値に対応する固有ベクトルが法線
+    // 固有値を距離²[m²]として扱えるよう正規化
+    cov /= point_count;
+
     let eigen = cov.symmetric_eigen();
+
+    // symmetric_eigen()の固有値順序は前提にしない
     let min_idx = eigen.eigenvalues.imin();
     let normal: Vector3<f32> = eigen.eigenvectors.column(min_idx).into_owned();
+
+    if normal.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+
     let d = -normal.dot(&centroid);
 
-    Some((normal, d))
+    // 昇順 λ0 <= λ1 <= λ2 に並べる
+    let mut values = [
+        eigen.eigenvalues[0].max(0.0),
+        eigen.eigenvalues[1].max(0.0),
+        eigen.eigenvalues[2].max(0.0),
+    ];
+
+    values.sort_by(|a, b| a.total_cmp(b));
+
+    let eigenvalues = Vector3::new(values[0], values[1], values[2]);
+
+    Some(PlaneFit {
+        normal,
+        d,
+        eigenvalues,
+    })
 }
 
 /// k 点すべてが平面 `normal·p + d = 0` から `threshold` 以内にあるか検証する。
@@ -70,8 +165,7 @@ pub fn check_source_to_plane_absolute_distance(
         return false;
     }
 
-    let point_to_plane_distance =
-        (normal.dot(&world_point.coords) + d).abs();
+    let point_to_plane_distance = (normal.dot(&world_point.coords) + d).abs();
 
     point_to_plane_distance <= max_distance_m
 }
@@ -176,6 +270,7 @@ pub fn pickup_valid_source_points<'a>(
     plane_point_distance_threshold: f32,
     source_plane_score_threshold: f32,
     source_to_plane_max_distance_m: Option<f32>,
+    min_planarity: Option<f32>,
     r_mat: &Matrix3<f32>,
     t_vec: &Vector3<f32>,
 ) -> Vec<PointCorrespondence<'a>> {
@@ -214,16 +309,31 @@ pub fn pickup_valid_source_points<'a>(
                 .map(|(c, _)| if c.is_point { c.point.0 } else { c.mean })
                 .collect();
 
-            let (normal, d) = fit_plane(&neighbor_points)?;
+            let plane_fit = fit_plane(&neighbor_points)?;
 
-            if !check_points_on_plane(&normal, d, &neighbor_points, plane_point_distance_threshold) {
+            if let Some(min_planarity) = min_planarity {
+                if !min_planarity.is_finite()
+                    || min_planarity < 0.0
+                    || min_planarity > 1.0
+                    || plane_fit.planarity() < min_planarity
+                {
+                    return None;
+                }
+            }
+
+            if !check_points_on_plane(
+                &plane_fit.normal,
+                plane_fit.d,
+                &neighbor_points,
+                plane_point_distance_threshold,
+            ) {
                 return None;
             }
 
             if let Some(max_distance_m) = source_to_plane_max_distance_m {
                 if !check_source_to_plane_absolute_distance(
-                    &normal,
-                    d,
+                    &plane_fit.normal,
+                    plane_fit.d,
                     &query_point,
                     max_distance_m,
                 ) {
@@ -233,7 +343,13 @@ pub fn pickup_valid_source_points<'a>(
 
             // センサ原点からの距離でスケールした閾値（ローカル座標の norm を使用）
             let sensor_dist = src_point.coords.norm();
-            if !check_source_on_plane(&normal, d, &query_point, sensor_dist, source_plane_score_threshold) {
+            if !check_source_on_plane(
+                &plane_fit.normal,
+                plane_fit.d,
+                &query_point,
+                sensor_dist,
+                source_plane_score_threshold,
+            ) {
                 return None;
             }
 
@@ -242,8 +358,8 @@ pub fn pickup_valid_source_points<'a>(
                 src_key: *src_key,
                 src_point,
                 target_cell: neighbors[0].0,
-                plane_normal: normal,
-                plane_d: d,
+                plane_normal: plane_fit.normal,
+                plane_d: plane_fit.d,
             })
         })
         .collect()
