@@ -11,7 +11,7 @@ use re_lidar_slam::{
     voxelization::voxel_downsample_points,
 };
 
-const LOAD_DIR: &str = "/home/kenji/mnt/nfs/share/airy96/07112026/park06";
+const LOAD_DIR: &str = "/home/kenji/mnt/nfs/share/airy96/06212026/park05";
 const SAVE_DIR: &str = "data/output/debug/07182026";
 
 const MIN_DIST: f32 = 0.5;
@@ -31,7 +31,8 @@ const GLOBAL_MAP_VOXEL_SIZE: f32 = 0.1; // m
 
 const NEIGHBOR_RANGE: i32 = 2; // Voxel search range for nearest neighbor search
 
-const KNN_K: usize = 7; // Number of nearest neighbors for plane fitting (Default: 5)
+const LOCAL_KNN_K: usize = 7;
+const GLOBAL_KNN_K: usize = 5; // Number of nearest neighbors for plane fitting (Default: 5)
 const SEARCH_RANGE: i32 = 2; // Voxel search range for nearest neighbor search
 const MAX_DIST_FACTOR: f32 = 2.5; // Maximum distance factor for nearest neighbor search (Prev: 3.0)
 // k近傍点が推定平面から離れてよい最大距離 [m]
@@ -41,7 +42,7 @@ const LOCAL_SOURCE_PLANE_SCORE_THRESHOLD: f32 = 0.90;
 const GLOBAL_SOURCE_PLANE_SCORE_THRESHOLD: f32 = 0.90;
 // GlobalMapへ追加するSource点と既存平面との最大距離 [m]
 const GLOBAL_SOURCE_TO_PLANE_MAX_DISTANCE_M: f32 = 0.03;
-const GLOBAL_MIN_PLANARITY: f32 = 0.3;
+const GLOBAL_MIN_PLANARITY: f32 = 0.15;
 
 const ICP_ITERATIONS: usize = 5; // Default: 5
 const ICP_RMSE_THRESHOLD: f32 = 0.077; // 収束判定: RMSE の変化量がこれ以下なら停止 // voxel size 0.2m の場合、0.07m くらいが妥当
@@ -95,7 +96,7 @@ fn main() -> Result<()> {
     let local_map_config = LocalMapConfig {
         index_voxel_size: LOCAL_MAP_VOXEL_SIZE,
         max_points_per_voxel: 20,
-        min_points_per_voxel: 3,
+        min_points_per_voxel: 5,
         min_observed_frames_per_voxel: 3,
         max_frames: 50,
         max_distance: MAX_DIST_FOR_VOXEL_MAP,
@@ -227,7 +228,7 @@ fn main() -> Result<()> {
                     &slam_map.local_voxel_map.voxel_map,
                     slam_map.local_voxel_map.config.index_voxel_size,
                     SEARCH_RANGE,
-                    KNN_K,
+                    LOCAL_KNN_K,
                     MAX_DIST_FACTOR,
                     LOCAL_PLANE_POINT_DISTANCE_THRESHOLD_M,
                     LOCAL_SOURCE_PLANE_SCORE_THRESHOLD,
@@ -371,7 +372,7 @@ fn main() -> Result<()> {
                     &slam_map.local_voxel_map.voxel_map,
                     slam_map.local_voxel_map.config.index_voxel_size,
                     SEARCH_RANGE,
-                    KNN_K,
+                    GLOBAL_KNN_K,
                     MAX_DIST_FACTOR,
                     GLOBAL_PLANE_POINT_DISTANCE_THRESHOLD_M,
                     GLOBAL_SOURCE_PLANE_SCORE_THRESHOLD,
@@ -404,15 +405,27 @@ fn main() -> Result<()> {
     }
 
     // --- Save the final global voxel map to a PCD file ---
+    let min_samples =
+    slam_map.global_voxel_map.config.min_points_per_voxel as u64;
+
+    let min_frames =
+        slam_map
+            .global_voxel_map
+            .config
+            .min_observed_frames_per_voxel as u64;
+
     let world_map_points: Vec<PointXYZ> = slam_map
         .global_voxel_map
         .voxel_map
         .values()
-        .filter(|cell| cell.is_point)
+        .filter(|cell| {
+            cell.sample_count >= min_samples
+                && cell.observed_frames >= min_frames
+        })
         .map(|cell| PointXYZ {
-            x: cell.point.0.x,
-            y: cell.point.0.y,
-            z: cell.point.0.z,
+            x: cell.mean.x,
+            y: cell.mean.y,
+            z: cell.mean.z,
         })
         .collect();
 

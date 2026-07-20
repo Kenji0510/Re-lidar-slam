@@ -39,6 +39,17 @@ pub struct VoxelCell {
     // Mean of this voxel coordinates.
     pub mean: Point3<f32>,
 
+    // Welford法の共分散計算用の中間値
+    pub m2: Matrix3<f32>,
+
+    // 統計更新に使用された観測数
+    pub sample_count: u64,
+
+    // 異なるフレームから観測された回数
+    pub observed_frames: u64,
+
+    pub last_observed_frame_id: Option<u64>,
+
     pub voxel_key: VoxelKey,
 
     /// 共分散行列（compute_covariances() 呼び出し後に有効）。
@@ -71,8 +82,8 @@ impl LOCALMap {
         }
     }
 
-    /// 変換済み点群をボクセルマップに追加する共通処理。
-    /// 既存ボクセルはボクセル中心 (mean) に近い点を採用。
+    // 同一フレーム内の点をボクセルごとに平均し、
+    // ボクセルの逐次平均・共分散を更新する。
     fn insert_points(&mut self, source_points: &[Point3<f32>], global_pose: &Matrix4<f64>) {
         let pose_f32 = global_pose.cast::<f32>();
         let r_mat: Matrix3<f32> = pose_f32.fixed_view::<3, 3>(0, 0).into();
@@ -91,19 +102,56 @@ impl LOCALMap {
             })
             .collect();
 
+        let mut frame_voxels: HashMap<VoxelKey, (Vector3<f32>, usize)> = HashMap::new();
+
+        for (key, point) in world_pts {
+            frame_voxels
+                .entry(key)
+                .and_modify(|(sum, count)| {
+                    *sum += point.coords;
+                    *count += 1;
+                })
+                .or_insert((point.coords, 1));
+        }
+
         // HashMap への挿入は順次（排他アクセスが必要）
-        for (key, p_world) in world_pts {
+        // for (key, p_world) in world_pts {
+        //     match self.voxel_map.entry(key) {
+        //         std::collections::hash_map::Entry::Vacant(e) => {
+        //             e.insert(VoxelCell::from_key(&key, voxel_size, p_world, frame_id));
+        //         }
+        //         std::collections::hash_map::Entry::Occupied(mut e) => {
+        //             let cell = e.get_mut();
+        //             let existing_dist_sq = (cell.point.0.coords - cell.mean.coords).norm_squared();
+        //             let new_dist_sq = (p_world.coords - cell.mean.coords).norm_squared();
+        //             if new_dist_sq < existing_dist_sq {
+        //                 cell.point = (p_world, frame_id);
+        //             }
+        //         }
+        //     }
+        // }
+
+        let min_samples = self.config.min_points_per_voxel;
+
+        for (key, (sum, count)) in frame_voxels {
+            let frame_mean = Point3::from(sum / count as f32);
+
             match self.voxel_map.entry(key) {
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert(VoxelCell::from_key(&key, voxel_size, p_world, frame_id));
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(VoxelCell::from_key(
+                        &key,
+                        voxel_size,
+                        frame_mean,
+                        frame_id,
+                    ));
                 }
-                std::collections::hash_map::Entry::Occupied(mut e) => {
-                    let cell = e.get_mut();
-                    let existing_dist_sq = (cell.point.0.coords - cell.mean.coords).norm_squared();
-                    let new_dist_sq = (p_world.coords - cell.mean.coords).norm_squared();
-                    if new_dist_sq < existing_dist_sq {
-                        cell.point = (p_world, frame_id);
-                    }
+
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    entry.get_mut().update_statistics(
+                        frame_mean,
+                        frame_id,
+                        min_samples,
+                    );
                 }
             }
         }
@@ -147,15 +195,22 @@ pub fn voxel_key(p: &Point3<f32>, voxel_size: f32) -> VoxelKey {
 impl VoxelCell {
     pub fn new() -> Self {
         Self {
-            point: (Point3::new(0.0, 0.0, 0.0), 0),
-            mean: Point3::new(0.0, 0.0, 0.0),
+            point: (Point3::origin(), 0),
+            is_point: true,
+            mean: Point3::origin(),
+
+            m2: Matrix3::zeros(),
+            sample_count: 0,
+            observed_frames: 0,
+            last_observed_frame_id: None,
+
             voxel_key: VoxelKey {
                 ix: 0,
                 iy: 0,
                 iz: 0,
             },
-            is_point: true,
-            covariance: Matrix3::identity(),
+
+            covariance: Matrix3::zeros(),
             covariance_valid: false,
         }
     }
@@ -168,11 +223,57 @@ impl VoxelCell {
         );
         Self {
             point: (point, frame_id),
-            mean: center,
-            voxel_key: *key,
             is_point: true,
-            covariance: Matrix3::identity(),
+
+            mean: point,
+            m2: Matrix3::zeros(),
+            sample_count: 1,
+            observed_frames: 1,
+            last_observed_frame_id: Some(frame_id),
+
+            voxel_key: *key,
+
+            covariance: Matrix3::zeros(),
             covariance_valid: false,
+        }
+    }
+
+    pub fn update_statistics(
+        &mut self,
+        point: Point3<f32>,
+        frame_id: u64,
+        min_samples_for_covariance: usize,
+    ) {
+        if !point.coords.iter().all(|v| v.is_finite()) {
+            return;
+        }
+
+        let new_count = self.sample_count + 1;
+
+        let delta = point.coords - self.mean.coords;
+        let new_mean = self.mean.coords + delta / new_count as f32;
+        let delta2 = point.coords - new_mean;
+
+        self.m2 += delta * delta2.transpose();
+
+        self.sample_count = new_count;
+        self.mean = Point3::from(new_mean);
+
+        if self.last_observed_frame_id != Some(frame_id) {
+            self.observed_frames += 1;
+            self.last_observed_frame_id = Some(frame_id);
+        }
+
+        self.point = (self.mean, frame_id);
+
+        if self.sample_count >= min_samples_for_covariance as u64 && self.sample_count >= 2 {
+            let covariance = self.m2 / (self.sample_count - 1) as f32;
+
+            self.covariance = (covariance + covariance.transpose()) * 0.5;
+
+            self.covariance_valid = self.covariance.iter().all(|v| v.is_finite());
+        } else {
+            self.covariance_valid = false;
         }
     }
 
