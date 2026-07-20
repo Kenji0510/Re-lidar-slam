@@ -11,7 +11,7 @@ use re_lidar_slam::{
     voxelization::voxel_downsample_points,
 };
 
-const LOAD_DIR: &str = "/home/kenji/mnt/nfs/share/airy96/06212026/park05";
+const LOAD_DIR: &str = "/home/kenji/mnt/nfs/share/airy96/06212026/park05";     // /home/kenji/mnt/nfs/share/airy96/06212026/park05
 const SAVE_DIR: &str = "data/output/debug/07182026";
 
 const MIN_DIST: f32 = 0.5;
@@ -27,7 +27,7 @@ const IMU_TO_LIDAR_QUAT_W: f64 = 0.00097028;
 
 const DOWNSAMPLE_VOXEL_SIZE: f32 = 0.2; // m
 const LOCAL_MAP_VOXEL_SIZE: f32 = 0.2; // m
-const GLOBAL_MAP_VOXEL_SIZE: f32 = 0.1; // m
+const GLOBAL_MAP_VOXEL_SIZE: f32 = 0.05; // m
 
 const NEIGHBOR_RANGE: i32 = 2; // Voxel search range for nearest neighbor search
 
@@ -45,7 +45,7 @@ const GLOBAL_SOURCE_TO_PLANE_MAX_DISTANCE_M: f32 = 0.03;
 const GLOBAL_MIN_PLANARITY: f32 = 0.15;
 
 const ICP_ITERATIONS: usize = 5; // Default: 5
-const ICP_RMSE_THRESHOLD: f32 = 0.077; // 収束判定: RMSE の変化量がこれ以下なら停止 // voxel size 0.2m の場合、0.07m くらいが妥当
+const ICP_RMSE_THRESHOLD: f32 = 0.033; // 収束判定: RMSE の変化量がこれ以下なら停止 // voxel size 0.2m の場合、0.07m くらいが妥当
 const ICP_RMSE_DIVERGE_THRESHOLD: f32 = 2.0; // 発散判定: RMSE がこれ以上なら結果棄却→IMU予測にフォールバック
 
 const MAX_DIST_FOR_VOXEL_MAP: f32 = 40.0;
@@ -105,8 +105,8 @@ fn main() -> Result<()> {
     let global_map_config = LocalMapConfig {
         index_voxel_size: GLOBAL_MAP_VOXEL_SIZE,
         max_points_per_voxel: 20,
-        min_points_per_voxel: 3,
-        min_observed_frames_per_voxel: 3,
+        min_points_per_voxel: 2,
+        min_observed_frames_per_voxel: 2,
         max_frames: 50,
         max_distance: MAX_DIST_FOR_VOXEL_MAP,
     };
