@@ -11,7 +11,7 @@ use re_lidar_slam::{
     voxelization::voxel_downsample_points,
 };
 
-const LOAD_DIR: &str = "/home/kenji/mnt/nfs/share/airy96/06212026/park05";     // /home/kenji/mnt/nfs/share/airy96/06212026/park05
+const LOAD_DIR: &str = "data/input/05162026/outdoor09"; // /home/kenji/mnt/nfs/share/airy96/06212026/park05
 const SAVE_DIR: &str = "data/output/debug/07182026";
 
 const MIN_DIST: f32 = 0.5;
@@ -25,9 +25,9 @@ const IMU_TO_LIDAR_QUAT_Y: f64 = 0.708767;
 const IMU_TO_LIDAR_QUAT_Z: f64 = -0.00246579;
 const IMU_TO_LIDAR_QUAT_W: f64 = 0.00097028;
 
-const DOWNSAMPLE_VOXEL_SIZE: f32 = 0.2; // m
-const LOCAL_MAP_VOXEL_SIZE: f32 = 0.2; // m
-const GLOBAL_MAP_VOXEL_SIZE: f32 = 0.05; // m
+const DOWNSAMPLE_VOXEL_SIZE: f32 = 0.1; // m
+const LOCAL_MAP_VOXEL_SIZE: f32 = 0.1; // m
+const GLOBAL_MAP_VOXEL_SIZE: f32 = 0.025; // m
 
 const NEIGHBOR_RANGE: i32 = 2; // Voxel search range for nearest neighbor search
 
@@ -41,7 +41,7 @@ const GLOBAL_PLANE_POINT_DISTANCE_THRESHOLD_M: f32 = 0.1;
 const LOCAL_SOURCE_PLANE_SCORE_THRESHOLD: f32 = 0.90;
 const GLOBAL_SOURCE_PLANE_SCORE_THRESHOLD: f32 = 0.90;
 // GlobalMapへ追加するSource点と既存平面との最大距離 [m]
-const GLOBAL_SOURCE_TO_PLANE_MAX_DISTANCE_M: f32 = 0.03;
+const GLOBAL_SOURCE_TO_PLANE_MAX_DISTANCE_M: f32 = 0.015;
 const GLOBAL_MIN_PLANARITY: f32 = 0.15;
 
 const ICP_ITERATIONS: usize = 5; // Default: 5
@@ -405,36 +405,39 @@ fn main() -> Result<()> {
     }
 
     // --- Save the final global voxel map to a PCD file ---
-    let min_samples =
-    slam_map.global_voxel_map.config.min_points_per_voxel as u64;
+    let min_samples = slam_map.global_voxel_map.config.min_points_per_voxel as u64;
 
-    let min_frames =
-        slam_map
-            .global_voxel_map
-            .config
-            .min_observed_frames_per_voxel as u64;
+    let min_frames = slam_map
+        .global_voxel_map
+        .config
+        .min_observed_frames_per_voxel as u64;
 
-    let world_map_points: Vec<PointXYZ> = slam_map
+    let world_map_points: Vec<Point3<f32>> = slam_map
         .global_voxel_map
         .voxel_map
         .values()
-        .filter(|cell| {
-            cell.sample_count >= min_samples
-                && cell.observed_frames >= min_frames
-        })
-        .map(|cell| PointXYZ {
-            x: cell.mean.x,
-            y: cell.mean.y,
-            z: cell.mean.z,
+        .filter(|cell| cell.sample_count >= min_samples && cell.observed_frames >= min_frames)
+        .map(|cell| Point3::new(cell.mean.x, cell.mean.y, cell.mean.z))
+        .collect();
+
+    let downsampled_world_map_points =
+        voxel_downsample_points(&world_map_points, GLOBAL_MAP_VOXEL_SIZE);
+    let downsampled_world_map_points_xyz: Vec<PointXYZ> = downsampled_world_map_points
+        .iter()
+        .map(|point| PointXYZ {
+            x: point.x,
+            y: point.y,
+            z: point.z,
         })
         .collect();
 
     let world_map_path = format!("{}/voxel-{}_world_map.pcd", SAVE_DIR, GLOBAL_MAP_VOXEL_SIZE);
     std::fs::create_dir_all(SAVE_DIR)?;
-    save_pcd_xyz(&world_map_points, &world_map_path)?;
+    save_pcd_xyz(&downsampled_world_map_points_xyz, &world_map_path)?;
     log::info!(
-        "Saved world map: {} points → {}",
+        "Saved downsampled world map: {} → {} points → {}",
         world_map_points.len(),
+        downsampled_world_map_points_xyz.len(),
         world_map_path
     );
     // --- Save the final global voxel map to a PCD file ---
