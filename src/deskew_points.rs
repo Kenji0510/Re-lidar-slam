@@ -1,16 +1,25 @@
-use nalgebra::{Point3, Unit, UnitQuaternion, Vector3};
+use nalgebra::{Point3, UnitQuaternion, Vector3};
 use rayon::prelude::*;
 
 use crate::{
-    convert_imu_data::DeltaRotation,
-    predict_pose_by_imu::RotationTrajectory,
-    types::{IMU, PointXYZIT},
+    convert_imu_data::DeltaRotation, predict_pose_by_imu::RotationTrajectory, types::PointXYZIT,
 };
+
+pub fn filter_points_by_distance(
+    pcd: &[PointXYZIT],
+    min_dist: f32,
+    max_dist: f32,
+) -> Vec<Point3<f32>> {
+    pcd.par_iter()
+        .filter(|p| is_valid_point(p, min_dist, max_dist))
+        .map(|p| Point3::new(p.x, p.y, p.z))
+        .collect()
+}
 
 pub fn deskew_points(
     pcd: &Vec<PointXYZIT>,
     trajectory: &RotationTrajectory,
-    imu_to_lidar: &UnitQuaternion<f64>,
+    _imu_to_lidar: &UnitQuaternion<f64>,
     frame_min_time: f64,
     min_dist: f32,
     max_dist: f32,
@@ -20,8 +29,7 @@ pub fn deskew_points(
 
     pcd.par_iter()
         .filter_map(|p| {
-            let dist_sq = p.x * p.x + p.y * p.y + p.z * p.z;
-            if dist_sq < min_dist * min_dist || dist_sq > max_dist * max_dist {
+            if !is_valid_point(p, min_dist, max_dist) || !p.timestamp.is_finite() {
                 return None;
             }
             let current_rotation = get_rotation_at_time(trajectory, p.timestamp);
@@ -38,17 +46,13 @@ pub fn deskew_points(
         .collect()
 }
 
-fn get_time_for_start_and_end(pcd: &Vec<PointXYZIT>) -> (f64, f64) {
-    let start = pcd
-        .iter()
-        .map(|p| p.timestamp)
-        .fold(f64::INFINITY, |a, b| a.min(b));
-    let end = pcd
-        .iter()
-        .map(|p| p.timestamp)
-        .fold(f64::NEG_INFINITY, |a, b| a.max(b));
+fn is_valid_point(point: &PointXYZIT, min_dist: f32, max_dist: f32) -> bool {
+    if !point.x.is_finite() || !point.y.is_finite() || !point.z.is_finite() {
+        return false;
+    }
 
-    (start, end)
+    let dist_sq = point.x * point.x + point.y * point.y + point.z * point.z;
+    dist_sq >= min_dist * min_dist && dist_sq <= max_dist * max_dist
 }
 
 // fn get_rotation_at_time(imu_data: &[DeltaRotation], timestamp: f64) -> UnitQuaternion<f64> {
@@ -102,4 +106,39 @@ pub fn get_imu_range(
         .unwrap_or(imu_data.len() - 1);
 
     (start_idx, end_idx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::filter_points_by_distance;
+    use crate::types::PointXYZIT;
+
+    fn point(x: f32, y: f32, z: f32) -> PointXYZIT {
+        PointXYZIT {
+            x,
+            y,
+            z,
+            intensity: 0.0,
+            timestamp: 0.0,
+        }
+    }
+
+    #[test]
+    fn distance_filter_removes_mid70_zero_and_non_finite_points() {
+        let points = vec![
+            point(0.0, 0.0, 0.0),
+            point(0.5, 0.0, 0.0),
+            point(2.0, 0.0, 0.0),
+            point(40.0, 0.0, 0.0),
+            point(41.0, 0.0, 0.0),
+            point(f32::NAN, 0.0, 0.0),
+        ];
+
+        let filtered = filter_points_by_distance(&points, 0.5, 40.0);
+
+        assert_eq!(filtered.len(), 3);
+        assert_eq!(filtered[0].x, 0.5);
+        assert_eq!(filtered[1].x, 2.0);
+        assert_eq!(filtered[2].x, 40.0);
+    }
 }

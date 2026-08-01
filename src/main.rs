@@ -1,21 +1,117 @@
-use anyhow::Result;
+use std::{fmt, str::FromStr};
+
+use anyhow::{Context, Result, bail, ensure};
 use nalgebra::{Matrix3, Matrix4, Point3, Quaternion, UnitQuaternion, Vector3};
 use re_lidar_slam::{
-    deskew_points::deskew_points,
+    deskew_points::{deskew_points, filter_points_by_distance},
     file_handler::{load_imu_data, load_pcd_files, load_pcd_xyzit, save_pcd_xyz},
     find_nearest_points::pickup_valid_source_points,
     icp::{apply_delta, build_point_to_plane_system, compute_rmse, solve_icp_delta},
-    predict_pose_by_imu::{align_imu_timestamps, build_rotation_trajectory, predict_pose_by_imu},
-    types::{CurrentFrameInfo, FrameLog, PointXYZ, ProcessTimes, SLAMMap},
+    predict_pose_by_imu::{
+        align_imu_timestamps, build_rotation_trajectory, predict_pose_by_constant_velocity,
+        predict_pose_by_imu,
+    },
+    types::{CurrentFrameInfo, FrameLog, IMU, PointXYZ, SLAMMap},
     voxel_map::{LOCALMap, LocalMapConfig, build_voxel_map},
     voxelization::voxel_downsample_points,
 };
 
+/*
+cargo run --release --bin re_lidar_slam -- \
+  --sensor mid70 \
+  --load-dir data/input/07262026/pcd/mid-70/test02 \
+  --save-dir data/output/debug/07262026
+ */
+
 const LOAD_DIR: &str = "data/input/05162026/outdoor09"; // /home/kenji/mnt/nfs/share/airy96/06212026/park05
 const SAVE_DIR: &str = "data/output/debug/07182026";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SensorType {
+    Airy96,
+    Mid70,
+}
+
+impl SensorType {
+    fn uses_imu(self) -> bool {
+        matches!(self, Self::Airy96)
+    }
+}
+
+impl FromStr for SensorType {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "airy96" | "airy-96" => Ok(Self::Airy96),
+            "mid70" | "mid-70" => Ok(Self::Mid70),
+            _ => bail!("Unsupported sensor '{value}'; expected airy96 or mid70"),
+        }
+    }
+}
+
+impl fmt::Display for SensorType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Airy96 => write!(f, "airy96"),
+            Self::Mid70 => write!(f, "mid70"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AppConfig {
+    sensor_type: SensorType,
+    load_dir: String,
+    save_dir: String,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            sensor_type: SensorType::Airy96,
+            load_dir: LOAD_DIR.to_owned(),
+            save_dir: SAVE_DIR.to_owned(),
+        }
+    }
+}
+
+impl AppConfig {
+    fn from_args() -> Result<Self> {
+        Self::parse(std::env::args().skip(1))
+    }
+
+    fn parse(args: impl IntoIterator<Item = String>) -> Result<Self> {
+        let mut config = Self::default();
+        let mut args = args.into_iter();
+
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--sensor" => {
+                    let value = args.next().context("--sensor requires a value")?;
+                    config.sensor_type = value.parse()?;
+                }
+                "--load-dir" => {
+                    config.load_dir = args.next().context("--load-dir requires a value")?;
+                }
+                "--save-dir" => {
+                    config.save_dir = args.next().context("--save-dir requires a value")?;
+                }
+                _ => bail!("Unknown argument '{arg}'; use --help to see supported arguments"),
+            }
+        }
+
+        Ok(config)
+    }
+}
+
+struct ImuContext {
+    samples: Vec<IMU>,
+    imu_to_lidar: UnitQuaternion<f64>,
+}
+
 const MIN_DIST: f32 = 0.5;
-const MAX_DIST: f32 = 40.0;
+const MAX_DIST: f32 = 100.0;
 
 // IMU coordination to LiDAR coordination (Robosense 96 beam)
 // Quaternion (x, y, z, w): -0.705437, 0.708767, -0.00246579, 0.00097028
@@ -25,9 +121,8 @@ const IMU_TO_LIDAR_QUAT_Y: f64 = 0.708767;
 const IMU_TO_LIDAR_QUAT_Z: f64 = -0.00246579;
 const IMU_TO_LIDAR_QUAT_W: f64 = 0.00097028;
 
-const DOWNSAMPLE_VOXEL_SIZE: f32 = 0.1; // m
-const LOCAL_MAP_VOXEL_SIZE: f32 = 0.1; // m
-const GLOBAL_MAP_VOXEL_SIZE: f32 = 0.025; // m
+const LOCAL_MAP_VOXEL_SIZE: f32 = 0.5; // m
+const GLOBAL_MAP_VOXEL_SIZE: f32 = 0.25; // m
 
 const NEIGHBOR_RANGE: i32 = 2; // Voxel search range for nearest neighbor search
 
@@ -46,23 +141,36 @@ const GLOBAL_MIN_PLANARITY: f32 = 0.15;
 
 const ICP_ITERATIONS: usize = 5; // Default: 5
 const ICP_RMSE_THRESHOLD: f32 = 0.033; // 収束判定: RMSE の変化量がこれ以下なら停止 // voxel size 0.2m の場合、0.07m くらいが妥当
-const ICP_RMSE_DIVERGE_THRESHOLD: f32 = 2.0; // 発散判定: RMSE がこれ以上なら結果棄却→IMU予測にフォールバック
+const ICP_RMSE_DIVERGE_THRESHOLD: f32 = 2.0; // 発散判定: RMSE がこれ以上なら結果棄却→予測姿勢にフォールバック
 
 const MAX_DIST_FOR_VOXEL_MAP: f32 = 40.0;
 
 fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
+    if std::env::args()
+        .skip(1)
+        .any(|arg| arg == "--help" || arg == "-h")
+    {
+        print_usage();
+        return Ok(());
+    }
 
-    let mut process_times = ProcessTimes {
-        total: 0.0,
-        find_nearest_points: 0.0,
-        icp: 0.0,
-        update_map: 0.0,
-    };
+    let config = AppConfig::from_args()?;
+
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
+    log::info!(
+        "Sensor: {}, input: {}, output: {}",
+        config.sensor_type,
+        config.load_dir,
+        config.save_dir
+    );
 
     // <--- Loading each data --->
-    let pcd_dir = format!("{}/pcd", LOAD_DIR);
+    let pcd_dir = format!("{}/pcd", config.load_dir);
     let pcd_files = load_pcd_files(&pcd_dir)?;
+    ensure!(
+        !pcd_files.is_empty(),
+        "No cloud_<number>.pcd files found in {pcd_dir}"
+    );
 
     log::debug!(
         "Found {} PCD files in directory: {}",
@@ -70,20 +178,30 @@ fn main() -> Result<()> {
         pcd_dir
     );
 
-    let imu_dir = format!("{}/imu", LOAD_DIR);
-    let imu_file = format!("{}/imu_data.json", imu_dir);
-    let imu_data = load_imu_data(&imu_file)?;
-    let imu_data = align_imu_timestamps(&imu_data); // Align IMU timestamps to seconds
-    // <--- Loading each data --->
+    let imu_context = if config.sensor_type.uses_imu() {
+        let imu_file = format!("{}/imu/imu_data.json", config.load_dir);
+        let imu_data = load_imu_data(&imu_file)?;
+        let imu_data = align_imu_timestamps(&imu_data); // Align IMU timestamps to seconds
+        ensure!(!imu_data.is_empty(), "No IMU samples found in {imu_file}");
 
-    // <--- IMU coord to LiDAR coord transformation --->
-    let imu_to_lidar = UnitQuaternion::new_normalize(Quaternion::new(
-        IMU_TO_LIDAR_QUAT_W,
-        IMU_TO_LIDAR_QUAT_X,
-        IMU_TO_LIDAR_QUAT_Y,
-        IMU_TO_LIDAR_QUAT_Z,
-    ));
-    // <--- IMU coord to LiDAR coord transformation --->
+        // <--- IMU coord to LiDAR coord transformation --->
+        let imu_to_lidar = UnitQuaternion::new_normalize(Quaternion::new(
+            IMU_TO_LIDAR_QUAT_W,
+            IMU_TO_LIDAR_QUAT_X,
+            IMU_TO_LIDAR_QUAT_Y,
+            IMU_TO_LIDAR_QUAT_Z,
+        ));
+        // <--- IMU coord to LiDAR coord transformation --->
+
+        Some(ImuContext {
+            samples: imu_data,
+            imu_to_lidar,
+        })
+    } else {
+        log::info!("Mid-70 mode: skipping IMU loading, IMU pose prediction, and deskew");
+        None
+    };
+    // <--- Loading each data --->
 
     // <--- Initialize current frame info --->
     let mut current_frame_info = CurrentFrameInfo {
@@ -119,8 +237,6 @@ fn main() -> Result<()> {
     let mut prev_frame_start_time: f64 = 0.0;
     let mut frame_logs: Vec<FrameLog> = Vec::new();
 
-    let start_time = std::time::Instant::now();
-
     //
     for (i, pcd_path) in pcd_files.iter().enumerate() {
         log::info!("Processing frame {}: {}", i, pcd_path.to_string_lossy());
@@ -139,52 +255,72 @@ fn main() -> Result<()> {
         if i == 0 {
             prev_frame_start_time = current_frame_start_time;
         }
+        let frame_delta_time = current_frame_start_time - prev_frame_start_time;
 
-        // <--- Predict pose by IMU --->
-        let pose_prediction = predict_pose_by_imu(
-            &imu_data,
-            &imu_to_lidar,
-            &current_frame_info.current_global_pose,
-            &current_frame_info.current_velocity,
-            prev_frame_start_time,
-            current_frame_start_time,
-        );
-        // <--- Predict pose by IMU --->
+        // --- Predict pose for the ICP initial value and fallback ---
+        let (pose_prediction, prediction_source) = match &imu_context {
+            Some(imu) => (
+                predict_pose_by_imu(
+                    &imu.samples,
+                    &imu.imu_to_lidar,
+                    &current_frame_info.current_global_pose,
+                    &current_frame_info.current_velocity,
+                    prev_frame_start_time,
+                    current_frame_start_time,
+                )
+                .0,
+                "IMU",
+            ),
+            None => (
+                predict_pose_by_constant_velocity(
+                    &current_frame_info.current_global_pose,
+                    &current_frame_info.current_velocity,
+                    frame_delta_time,
+                ),
+                "previous-frame velocity",
+            ),
+        };
+        // --- Predict pose for the ICP initial value and fallback ---
 
-        // <--- Build rotation trajectory --->
-        let rotation_traj = build_rotation_trajectory(
-            &imu_data,
-            current_frame_start_time,
-            current_frame_end_time,
-            &imu_to_lidar,
-        );
-        // <--- Build rotation trajectory --->
+        let processed_points = match &imu_context {
+            Some(imu) => {
+                // <--- Build rotation trajectory --->
+                let rotation_traj = build_rotation_trajectory(
+                    &imu.samples,
+                    current_frame_start_time,
+                    current_frame_end_time,
+                    &imu.imu_to_lidar,
+                );
+                // <--- Build rotation trajectory --->
 
-        // --- Deskew source pcd ---
-        let deskewed_points = deskew_points(
-            &source_pcd,
-            &rotation_traj,
-            &imu_to_lidar,
-            current_frame_start_time,
-            MIN_DIST,
-            MAX_DIST,
-        );
-        // --- Deskew source pcd ---
+                // --- Deskew source pcd ---
+                deskew_points(
+                    &source_pcd,
+                    &rotation_traj,
+                    &imu.imu_to_lidar,
+                    current_frame_start_time,
+                    MIN_DIST,
+                    MAX_DIST,
+                )
+                // --- Deskew source pcd ---
+            }
+            None => filter_points_by_distance(&source_pcd, MIN_DIST, MAX_DIST),
+        };
 
-        // --- Downsample deskewed points ---
+        // --- Downsample processed points ---
         let voxel_start = std::time::Instant::now();
         let downsampled_source_points_for_local =
-            voxel_downsample_points(&deskewed_points, LOCAL_MAP_VOXEL_SIZE);
+            voxel_downsample_points(&processed_points, LOCAL_MAP_VOXEL_SIZE);
         let downsampled_source_points_for_global =
-            voxel_downsample_points(&deskewed_points, GLOBAL_MAP_VOXEL_SIZE);
+            voxel_downsample_points(&processed_points, GLOBAL_MAP_VOXEL_SIZE);
         let voxel_end = voxel_start.elapsed();
         log::debug!(
             "Frame {i}: Downsampled {} points → {} points in {:.2?}",
-            deskewed_points.len(),
+            processed_points.len(),
             downsampled_source_points_for_local.len(),
             voxel_end
         );
-        // --- Downsample deskewed points ---
+        // --- Downsample processed points ---
 
         // --- Build voxel map for source points ---
         let build_map_start = std::time::Instant::now();
@@ -205,8 +341,8 @@ fn main() -> Result<()> {
         // --- Build voxel map for source points ---
 
         // --- ICP (Point to Plane) ---
-        // IMU 予測姿勢を初期値として (R, t) を取り出す
-        let pred_pose = pose_prediction.0.cast::<f32>();
+        // センサーモードに応じた予測姿勢を初期値として (R, t) を取り出す
+        let pred_pose = pose_prediction.cast::<f32>();
         let mut r_mat: Matrix3<f32> = pred_pose.fixed_view::<3, 3>(0, 0).into();
         let mut t_vec: Vector3<f32> = pred_pose.fixed_view::<3, 1>(0, 3).into();
 
@@ -274,10 +410,11 @@ fn main() -> Result<()> {
                     rmse
                 );
 
-                // RMSE が発散した場合は ICP 結果を棄却して IMU 予測に戻す
+                // RMSE が発散した場合は ICP 結果を棄却して予測姿勢に戻す
                 if rmse > ICP_RMSE_DIVERGE_THRESHOLD {
                     log::warn!(
-                        "ICP iter {_iter}: RMSE diverged ({rmse:.4}), reverting to IMU prediction"
+                        "ICP iter {_iter}: RMSE diverged ({rmse:.4}), reverting to \
+                         {prediction_source} prediction"
                     );
                     r_mat = pred_pose.fixed_view::<3, 3>(0, 0).into();
                     t_vec = pred_pose.fixed_view::<3, 1>(0, 3).into();
@@ -297,7 +434,7 @@ fn main() -> Result<()> {
             }
 
             if !icp_ok {
-                log::warn!("Frame {i}: ICP failed, using IMU prediction");
+                log::warn!("Frame {i}: ICP failed, using {prediction_source} prediction");
             }
         }
         let loop_end = loop_start.elapsed();
@@ -325,7 +462,7 @@ fn main() -> Result<()> {
         new_global_pose.fixed_view_mut::<3, 1>(0, 3).copy_from(&t64);
 
         let new_pos = new_global_pose.fixed_view::<3, 1>(0, 3).into_owned();
-        let dt = (current_frame_start_time - prev_frame_start_time).max(1e-6);
+        let dt = frame_delta_time.max(1e-6);
         let raw_velocity = (new_pos - prev_pos) / dt;
         // 速度が異常に大きい場合（ICP 発散など）はクランプして安定化
         let new_velocity = raw_velocity.cap_magnitude(2.0);
@@ -431,8 +568,11 @@ fn main() -> Result<()> {
         })
         .collect();
 
-    let world_map_path = format!("{}/voxel-{}_world_map.pcd", SAVE_DIR, GLOBAL_MAP_VOXEL_SIZE);
-    std::fs::create_dir_all(SAVE_DIR)?;
+    let world_map_path = format!(
+        "{}/voxel-{}_world_map.pcd",
+        config.save_dir, GLOBAL_MAP_VOXEL_SIZE
+    );
+    std::fs::create_dir_all(&config.save_dir)?;
     save_pcd_xyz(&downsampled_world_map_points_xyz, &world_map_path)?;
     log::info!(
         "Saved downsampled world map: {} → {} points → {}",
@@ -443,7 +583,7 @@ fn main() -> Result<()> {
     // --- Save the final global voxel map to a PCD file ---
 
     // --- Save per-frame ICP logs to JSON ---
-    let frame_logs_path = format!("{}/frame_logs.json", SAVE_DIR);
+    let frame_logs_path = format!("{}/frame_logs.json", config.save_dir);
     let frame_logs_json = serde_json::to_string_pretty(&frame_logs)?;
     std::fs::write(&frame_logs_path, &frame_logs_json)?;
     log::info!(
@@ -454,4 +594,45 @@ fn main() -> Result<()> {
     // --- Save per-frame ICP logs to JSON ---
 
     Ok(())
+}
+
+fn print_usage() {
+    println!(
+        "Usage: re_lidar_slam [--sensor airy96|mid70] [--load-dir DIR] [--save-dir DIR]\n\
+         Defaults: --sensor airy96 --load-dir {LOAD_DIR} --save-dir {SAVE_DIR}"
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AppConfig, LOAD_DIR, SAVE_DIR, SensorType};
+
+    #[test]
+    fn app_config_preserves_airy96_defaults() {
+        let config = AppConfig::parse(Vec::new()).unwrap();
+
+        assert_eq!(config.sensor_type, SensorType::Airy96);
+        assert_eq!(config.load_dir, LOAD_DIR);
+        assert_eq!(config.save_dir, SAVE_DIR);
+    }
+
+    #[test]
+    fn app_config_accepts_mid70_and_custom_directories() {
+        let config = AppConfig::parse(
+            [
+                "--sensor",
+                "mid-70",
+                "--load-dir",
+                "mid-input",
+                "--save-dir",
+                "mid-output",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+
+        assert_eq!(config.sensor_type, SensorType::Mid70);
+        assert_eq!(config.load_dir, "mid-input");
+        assert_eq!(config.save_dir, "mid-output");
+    }
 }

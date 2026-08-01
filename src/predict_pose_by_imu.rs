@@ -117,6 +117,29 @@ pub fn predict_pose_by_imu(
     (delta_transform, velocity)
 }
 
+/// Predicts the next pose without IMU data.
+///
+/// Translation uses the previous world-frame velocity estimated from ICP.
+/// Rotation stays at the latest ICP estimate instead of extrapolating an
+/// unverified rotation during consecutive ICP fallbacks.
+pub fn predict_pose_by_constant_velocity(
+    prev_pose: &Matrix4<f64>,
+    prev_velocity: &Vector3<f64>,
+    delta_time: f64,
+) -> Matrix4<f64> {
+    let mut predicted_pose = *prev_pose;
+
+    if !delta_time.is_finite() || delta_time <= 0.0 {
+        return predicted_pose;
+    }
+
+    predicted_pose[(0, 3)] += prev_velocity.x * delta_time;
+    predicted_pose[(1, 3)] += prev_velocity.y * delta_time;
+    predicted_pose[(2, 3)] += prev_velocity.z * delta_time;
+
+    predicted_pose
+}
+
 pub fn get_imu_range(
     imu_data: &Vec<IMU>,
     frame_time_range: (f64, f64), // (start_time, end_time) sec
@@ -180,4 +203,49 @@ pub fn build_rotation_trajectory(
     }
 
     trajectory
+}
+
+#[cfg(test)]
+mod tests {
+    use nalgebra::{Matrix4, Rotation3, Vector3};
+
+    use super::predict_pose_by_constant_velocity;
+
+    #[test]
+    fn constant_velocity_prediction_advances_translation_and_preserves_rotation() {
+        let rotation = Rotation3::from_euler_angles(0.1, -0.2, 0.3);
+        let mut pose = Matrix4::<f64>::identity();
+        pose.fixed_view_mut::<3, 3>(0, 0)
+            .copy_from(rotation.matrix());
+        pose[(0, 3)] = 1.0;
+        pose[(1, 3)] = 2.0;
+        pose[(2, 3)] = 3.0;
+
+        let predicted =
+            predict_pose_by_constant_velocity(&pose, &Vector3::new(2.0, -1.0, 0.5), 0.1);
+
+        assert_eq!(
+            predicted.fixed_view::<3, 3>(0, 0),
+            pose.fixed_view::<3, 3>(0, 0)
+        );
+        assert!((predicted[(0, 3)] - 1.2).abs() < 1e-12);
+        assert!((predicted[(1, 3)] - 1.9).abs() < 1e-12);
+        assert!((predicted[(2, 3)] - 3.05).abs() < 1e-12);
+    }
+
+    #[test]
+    fn constant_velocity_prediction_ignores_invalid_delta_time() {
+        let mut pose = Matrix4::<f64>::identity();
+        pose[(0, 3)] = 1.0;
+        let velocity = Vector3::new(2.0, 0.0, 0.0);
+
+        assert_eq!(
+            predict_pose_by_constant_velocity(&pose, &velocity, -0.1),
+            pose
+        );
+        assert_eq!(
+            predict_pose_by_constant_velocity(&pose, &velocity, f64::NAN),
+            pose
+        );
+    }
 }
