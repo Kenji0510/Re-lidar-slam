@@ -138,20 +138,13 @@ impl LOCALMap {
 
             match self.voxel_map.entry(key) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert(VoxelCell::from_key(
-                        &key,
-                        voxel_size,
-                        frame_mean,
-                        frame_id,
-                    ));
+                    entry.insert(VoxelCell::from_key(&key, voxel_size, frame_mean, frame_id));
                 }
 
                 std::collections::hash_map::Entry::Occupied(mut entry) => {
-                    entry.get_mut().update_statistics(
-                        frame_mean,
-                        frame_id,
-                        min_samples,
-                    );
+                    entry
+                        .get_mut()
+                        .update_statistics(frame_mean, frame_id, min_samples);
                 }
             }
         }

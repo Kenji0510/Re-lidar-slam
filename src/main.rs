@@ -23,8 +23,9 @@ cargo run --release --bin re_lidar_slam -- \
   --save-dir data/output/debug/07262026
  */
 
-const LOAD_DIR: &str = "data/input/05162026/outdoor09"; // /home/kenji/mnt/nfs/share/airy96/06212026/park05
-const SAVE_DIR: &str = "data/output/debug/07182026";
+const LOAD_DIR_AIRY96: &str = "data/input/05162026/outdoor09"; // /home/kenji/mnt/nfs/share/airy96/06212026/park05
+const LOAD_DIR_MID70: &str = "data/input/05162026/outdoor09"; // /home/kenji/mnt/nfs/share/airy96/06212026/park05
+const SAVE_DIR: &str = "data/output/debug/08012026";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SensorType {
@@ -70,7 +71,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             sensor_type: SensorType::Airy96,
-            load_dir: LOAD_DIR.to_owned(),
+            load_dir: LOAD_DIR_AIRY96.to_owned(),
             save_dir: SAVE_DIR.to_owned(),
         }
     }
@@ -110,8 +111,9 @@ struct ImuContext {
     imu_to_lidar: UnitQuaternion<f64>,
 }
 
-const MIN_DIST: f32 = 0.5;
-const MAX_DIST: f32 = 100.0;
+// --- The parametrers for Airy 96 ---
+const MIN_DIST_AIRY96: f32 = 0.5;
+const MAX_DIST_AIRY96: f32 = 100.0;
 
 // IMU coordination to LiDAR coordination (Robosense 96 beam)
 // Quaternion (x, y, z, w): -0.705437, 0.708767, -0.00246579, 0.00097028
@@ -121,65 +123,108 @@ const IMU_TO_LIDAR_QUAT_Y: f64 = 0.708767;
 const IMU_TO_LIDAR_QUAT_Z: f64 = -0.00246579;
 const IMU_TO_LIDAR_QUAT_W: f64 = 0.00097028;
 
-const LOCAL_MAP_VOXEL_SIZE: f32 = 0.5; // m
-const GLOBAL_MAP_VOXEL_SIZE: f32 = 0.25; // m
+const LOCAL_MAP_VOXEL_SIZE_AIRY96: f32 = 0.5; // m
+const GLOBAL_MAP_VOXEL_SIZE_AIRY96: f32 = 0.25; // m
 
-const NEIGHBOR_RANGE: i32 = 2; // Voxel search range for nearest neighbor search
+const NEIGHBOR_RANGE_AIRY96: i32 = 2; // Voxel search range for nearest neighbor search
 
-const LOCAL_KNN_K: usize = 7;
-const GLOBAL_KNN_K: usize = 5; // Number of nearest neighbors for plane fitting (Default: 5)
-const SEARCH_RANGE: i32 = 2; // Voxel search range for nearest neighbor search
-const MAX_DIST_FACTOR: f32 = 2.5; // Maximum distance factor for nearest neighbor search (Prev: 3.0)
+const LOCAL_KNN_K_AIRY96: usize = 7;
+const GLOBAL_KNN_K_AIRY96: usize = 5; // Number of nearest neighbors for plane fitting (Default: 5)
+const SEARCH_RANGE_AIRY96: i32 = 2; // Voxel search range for nearest neighbor search
+const MAX_DIST_FACTOR_AIRY96: f32 = 2.5; // Maximum distance factor for nearest neighbor search (Prev: 3.0)
 // k近傍点が推定平面から離れてよい最大距離 [m]
-const LOCAL_PLANE_POINT_DISTANCE_THRESHOLD_M: f32 = 0.1;
-const GLOBAL_PLANE_POINT_DISTANCE_THRESHOLD_M: f32 = 0.1;
-const LOCAL_SOURCE_PLANE_SCORE_THRESHOLD: f32 = 0.90;
-const GLOBAL_SOURCE_PLANE_SCORE_THRESHOLD: f32 = 0.90;
+const LOCAL_PLANE_POINT_DISTANCE_THRESHOLD_M_AIRY96: f32 = 0.1;
+const GLOBAL_PLANE_POINT_DISTANCE_THRESHOLD_M_AIRY96: f32 = 0.1;
+const LOCAL_SOURCE_PLANE_SCORE_THRESHOLD_AIRY96: f32 = 0.90;
+const GLOBAL_SOURCE_PLANE_SCORE_THRESHOLD_AIRY96: f32 = 0.90;
 // GlobalMapへ追加するSource点と既存平面との最大距離 [m]
-const GLOBAL_SOURCE_TO_PLANE_MAX_DISTANCE_M: f32 = 0.015;
-const GLOBAL_MIN_PLANARITY: f32 = 0.15;
+const GLOBAL_SOURCE_TO_PLANE_MAX_DISTANCE_M_AIRY96: f32 = 0.015;
+const GLOBAL_MIN_PLANARITY_AIRY96: f32 = 0.15;
 
-const ICP_ITERATIONS: usize = 5; // Default: 5
-const ICP_RMSE_THRESHOLD: f32 = 0.033; // 収束判定: RMSE の変化量がこれ以下なら停止 // voxel size 0.2m の場合、0.07m くらいが妥当
-const ICP_RMSE_DIVERGE_THRESHOLD: f32 = 2.0; // 発散判定: RMSE がこれ以上なら結果棄却→予測姿勢にフォールバック
+const ICP_ITERATIONS_AIRY96: usize = 5; // Default: 5
+const ICP_RMSE_THRESHOLD_AIRY96: f32 = 0.033; // 収束判定: RMSE の変化量がこれ以下なら停止 // voxel size 0.2m の場合、0.07m くらいが妥当
+const ICP_RMSE_DIVERGE_THRESHOLD_AIRY96: f32 = 2.0; // 発散判定: RMSE がこれ以上なら結果棄却→予測姿勢にフォールバック
 
-const MAX_DIST_FOR_VOXEL_MAP: f32 = 40.0;
+const MAX_DIST_FOR_VOXEL_MAP_AIRY96: f32 = 40.0;
+// --- The parametrers for Airy 96 ---
+
+// --- The parametrers for Mid-70 ---
+const LOCAL_MAP_VOXEL_SIZE_MID70: f32 = 0.5; // m
+const GLOBAL_MAP_VOXEL_SIZE_MID70: f32 = 0.25; // m
+
+const MAX_DIST_FOR_VOXEL_MAP_MID70: f32 = 150.0;
+
+const MIN_DIST_MID70: f32 = 0.5;
+const MAX_DIST_MID70: f32 = 150.0;
+
+const NEIGHBOR_RANGE_MID70: i32 = 3; // Voxel search range for nearest neighbor search
+
+const LOCAL_KNN_K_MID70: usize = 7;
+const GLOBAL_KNN_K_MID70: usize = 5; // Number of nearest neighbors for plane fitting (Default: 5)
+const SEARCH_RANGE_MID70: i32 = 2; // Voxel search range for nearest neighbor search
+const MAX_DIST_FACTOR_MID70: f32 = 2.5; // Maximum distance factor for nearest neighbor search (Prev: 3.0)
+// k近傍点が推定平面から離れてよい最大距離 [m]
+const LOCAL_PLANE_POINT_DISTANCE_THRESHOLD_M_MID70: f32 = 0.1;
+const GLOBAL_PLANE_POINT_DISTANCE_THRESHOLD_M_MID70: f32 = 0.1;
+const LOCAL_SOURCE_PLANE_SCORE_THRESHOLD_MID70: f32 = 0.90;
+const GLOBAL_SOURCE_PLANE_SCORE_THRESHOLD_MID70: f32 = 0.90;
+// GlobalMapへ追加するSource点と既存平面との最大距離 [m]
+const GLOBAL_SOURCE_TO_PLANE_MAX_DISTANCE_M_MID70: f32 = 0.015;
+const GLOBAL_MIN_PLANARITY_MID70: f32 = 0.15;
+
+const ICP_ITERATIONS_MID70: usize = 5; // Default: 5
+const ICP_RMSE_THRESHOLD_MID70: f32 = 0.033; // 収束判定: RMSE の変化量がこれ以下なら停止 // voxel size 0.2m の場合、0.07m くらいが妥当
+const ICP_RMSE_DIVERGE_THRESHOLD_MID70: f32 = 2.0; // 発散判定: RMSE がこれ以上なら結果棄却→予測姿勢にフォールバック
+// --- The parametrers for Mid-70 ---
 
 fn main() -> Result<()> {
-    if std::env::args()
-        .skip(1)
-        .any(|arg| arg == "--help" || arg == "-h")
-    {
-        print_usage();
-        return Ok(());
-    }
+    // if std::env::args()
+    //     .skip(1)
+    //     .any(|arg| arg == "--help" || arg == "-h")
+    // {
+    //     print_usage();
+    //     return Ok(());
+    // }
 
-    let config = AppConfig::from_args()?;
+    // let config = AppConfig::from_args()?;
 
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
-    log::info!(
-        "Sensor: {}, input: {}, output: {}",
-        config.sensor_type,
-        config.load_dir,
-        config.save_dir
-    );
+    // log::info!(
+    //     "Sensor: {}, input: {}, output: {}",
+    //     config.sensor_type,
+    //     config.load_dir,
+    //     config.save_dir
+    // );
 
     // <--- Loading each data --->
-    let pcd_dir = format!("{}/pcd", config.load_dir);
-    let pcd_files = load_pcd_files(&pcd_dir)?;
+    let pcd_dir_airy96 = format!("{}/pcd", LOAD_DIR_AIRY96);
+    let pcd_files_airy96 = load_pcd_files(&pcd_dir_airy96)?;
     ensure!(
-        !pcd_files.is_empty(),
-        "No cloud_<number>.pcd files found in {pcd_dir}"
+        !pcd_files_airy96.is_empty(),
+        "No cloud_<number>.pcd files found in {pcd_dir_airy96}"
+    );
+
+    let pcd_dir_mid70 = format!("{}/pcd", LOAD_DIR_MID70);
+    let pcd_files_mid70 = load_pcd_files(&pcd_dir_mid70)?;
+    ensure!(
+        !pcd_files_mid70.is_empty(),
+        "No cloud_<number>.pcd files found in {pcd_dir_mid70}"
     );
 
     log::debug!(
         "Found {} PCD files in directory: {}",
-        pcd_files.len(),
-        pcd_dir
+        pcd_files_airy96.len(),
+        pcd_dir_airy96
     );
 
-    let imu_context = if config.sensor_type.uses_imu() {
-        let imu_file = format!("{}/imu/imu_data.json", config.load_dir);
+    log::debug!(
+        "Found {} PCD files in directory: {}",
+        pcd_files_mid70.len(),
+        pcd_dir_mid70
+    );
+
+    let imu_context = if SensorType::Mid70.uses_imu() {
+        let imu_file = format!("{}/imu/imu_data.json", LOAD_DIR_AIRY96);
         let imu_data = load_imu_data(&imu_file)?;
         let imu_data = align_imu_timestamps(&imu_data); // Align IMU timestamps to seconds
         ensure!(!imu_data.is_empty(), "No IMU samples found in {imu_file}");
@@ -212,50 +257,98 @@ fn main() -> Result<()> {
 
     // <--- Initialize SLAM map --->
     let local_map_config = LocalMapConfig {
-        index_voxel_size: LOCAL_MAP_VOXEL_SIZE,
+        index_voxel_size: LOCAL_MAP_VOXEL_SIZE_AIRY96,
         max_points_per_voxel: 20,
         min_points_per_voxel: 5,
         min_observed_frames_per_voxel: 3,
         max_frames: 50,
-        max_distance: MAX_DIST_FOR_VOXEL_MAP,
+        max_distance: MAX_DIST_FOR_VOXEL_MAP_AIRY96,
     };
 
     let global_map_config = LocalMapConfig {
-        index_voxel_size: GLOBAL_MAP_VOXEL_SIZE,
+        index_voxel_size: GLOBAL_MAP_VOXEL_SIZE_AIRY96,
         max_points_per_voxel: 20,
         min_points_per_voxel: 2,
         min_observed_frames_per_voxel: 2,
         max_frames: 50,
-        max_distance: MAX_DIST_FOR_VOXEL_MAP,
+        max_distance: MAX_DIST_FOR_VOXEL_MAP_AIRY96,
     };
     let mut slam_map = SLAMMap {
         global_voxel_map: LOCALMap::new(global_map_config),
         local_voxel_map: LOCALMap::new(local_map_config),
+    };
+
+    let local_map_config_mid70 = LocalMapConfig {
+        index_voxel_size: LOCAL_MAP_VOXEL_SIZE_MID70,
+        max_points_per_voxel: 20,
+        min_points_per_voxel: 5,
+        min_observed_frames_per_voxel: 3,
+        max_frames: 50,
+        max_distance: MAX_DIST_FOR_VOXEL_MAP_MID70,
+    };
+
+    let global_map_config_mid70 = LocalMapConfig {
+        index_voxel_size: GLOBAL_MAP_VOXEL_SIZE_MID70,
+        max_points_per_voxel: 20,
+        min_points_per_voxel: 2,
+        min_observed_frames_per_voxel: 2,
+        max_frames: 50,
+        max_distance: MAX_DIST_FOR_VOXEL_MAP_MID70,
+    };
+    let mut slam_map_mid70 = SLAMMap {
+        global_voxel_map: LOCALMap::new(global_map_config_mid70),
+        local_voxel_map: LOCALMap::new(local_map_config_mid70),
     };
     // <--- Initialize SLAM map --->
 
     let mut prev_frame_start_time: f64 = 0.0;
     let mut frame_logs: Vec<FrameLog> = Vec::new();
 
+    ensure!(
+        pcd_files_airy96.len() == pcd_files_mid70.len(),
+        "PCD frame count mismatch: Airy96 has {} frames, Mid-70 has {} frames",
+        pcd_files_airy96.len(),
+        pcd_files_mid70.len()
+    );
+
     //
-    for (i, pcd_path) in pcd_files.iter().enumerate() {
-        log::info!("Processing frame {}: {}", i, pcd_path.to_string_lossy());
+    for (i, (pcd_path_airy96, pcd_path_mid70)) in pcd_files_airy96
+        .iter()
+        .zip(pcd_files_mid70.iter())
+        .enumerate()
+    {
+        log::info!(
+            "Processing frame {}: Airy96={}, Mid-70={}",
+            i,
+            pcd_path_airy96.to_string_lossy(),
+            pcd_path_mid70.to_string_lossy()
+        );
 
-        let source_pcd = load_pcd_xyzit(&pcd_path.to_string_lossy())?;
+        let source_pcd_airy96 = load_pcd_xyzit(&pcd_path_airy96.to_string_lossy())?;
 
-        let current_frame_start_time = source_pcd
+        let source_pcd_mid70 = load_pcd_xyzit(&pcd_path_mid70.to_string_lossy())?;
+
+        let current_frame_start_time_airy96 = source_pcd_airy96
             .iter()
             .map(|p| p.timestamp)
             .fold(f64::INFINITY, f64::min);
-        let current_frame_end_time = source_pcd
+        let current_frame_end_time_airy96 = source_pcd_airy96
+            .iter()
+            .map(|p| p.timestamp)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let current_frame_start_time_mid70 = source_pcd_mid70
+            .iter()
+            .map(|p| p.timestamp)
+            .fold(f64::INFINITY, f64::min);
+        let current_frame_end_time_mid70 = source_pcd_mid70
             .iter()
             .map(|p| p.timestamp)
             .fold(f64::NEG_INFINITY, f64::max);
 
         if i == 0 {
-            prev_frame_start_time = current_frame_start_time;
+            prev_frame_start_time = current_frame_start_time_airy96;
         }
-        let frame_delta_time = current_frame_start_time - prev_frame_start_time;
+        let frame_delta_time = current_frame_start_time_airy96 - prev_frame_start_time;
 
         // --- Predict pose for the ICP initial value and fallback ---
         let (pose_prediction, prediction_source) = match &imu_context {
@@ -266,7 +359,7 @@ fn main() -> Result<()> {
                     &current_frame_info.current_global_pose,
                     &current_frame_info.current_velocity,
                     prev_frame_start_time,
-                    current_frame_start_time,
+                    current_frame_start_time_airy96,
                 )
                 .0,
                 "IMU",
@@ -282,58 +375,108 @@ fn main() -> Result<()> {
         };
         // --- Predict pose for the ICP initial value and fallback ---
 
-        let processed_points = match &imu_context {
+        let processed_points_airy96 = match &imu_context {
             Some(imu) => {
                 // <--- Build rotation trajectory --->
                 let rotation_traj = build_rotation_trajectory(
                     &imu.samples,
-                    current_frame_start_time,
-                    current_frame_end_time,
+                    current_frame_start_time_airy96,
+                    current_frame_end_time_airy96,
                     &imu.imu_to_lidar,
                 );
                 // <--- Build rotation trajectory --->
 
                 // --- Deskew source pcd ---
                 deskew_points(
-                    &source_pcd,
+                    &source_pcd_airy96,
                     &rotation_traj,
                     &imu.imu_to_lidar,
-                    current_frame_start_time,
-                    MIN_DIST,
-                    MAX_DIST,
+                    current_frame_start_time_airy96,
+                    MIN_DIST_AIRY96,
+                    MAX_DIST_AIRY96,
                 )
                 // --- Deskew source pcd ---
             }
-            None => filter_points_by_distance(&source_pcd, MIN_DIST, MAX_DIST),
+            None => filter_points_by_distance(&source_pcd_airy96, MIN_DIST_AIRY96, MAX_DIST_AIRY96),
+        };
+
+        let processed_points_mid70 = match &imu_context {
+            Some(imu) => {
+                // <--- Build rotation trajectory --->
+                let rotation_traj = build_rotation_trajectory(
+                    &imu.samples,
+                    current_frame_start_time_mid70,
+                    current_frame_end_time_mid70,
+                    &imu.imu_to_lidar,
+                );
+                // <--- Build rotation trajectory --->
+
+                // --- Deskew source pcd ---
+                deskew_points(
+                    &source_pcd_mid70,
+                    &rotation_traj,
+                    &imu.imu_to_lidar,
+                    current_frame_start_time_mid70,
+                    MIN_DIST_MID70,
+                    MAX_DIST_MID70,
+                )
+                // --- Deskew source pcd ---
+            }
+            None => filter_points_by_distance(&source_pcd_mid70, MIN_DIST_MID70, MAX_DIST_MID70),
         };
 
         // --- Downsample processed points ---
         let voxel_start = std::time::Instant::now();
-        let downsampled_source_points_for_local =
-            voxel_downsample_points(&processed_points, LOCAL_MAP_VOXEL_SIZE);
-        let downsampled_source_points_for_global =
-            voxel_downsample_points(&processed_points, GLOBAL_MAP_VOXEL_SIZE);
+        let downsampled_source_points_for_local_airy96 =
+            voxel_downsample_points(&processed_points_airy96, LOCAL_MAP_VOXEL_SIZE_AIRY96);
+        let downsampled_source_points_for_global_airy96 =
+            voxel_downsample_points(&processed_points_airy96, GLOBAL_MAP_VOXEL_SIZE_AIRY96);
+        // let voxel_end = voxel_start.elapsed();
+
+        let downsampled_source_points_for_local_mid70 =
+            voxel_downsample_points(&processed_points_mid70, LOCAL_MAP_VOXEL_SIZE_MID70);
+        let downsampled_source_points_for_global_mid70 =
+            voxel_downsample_points(&processed_points_mid70, GLOBAL_MAP_VOXEL_SIZE_MID70);
         let voxel_end = voxel_start.elapsed();
+
         log::debug!(
-            "Frame {i}: Downsampled {} points → {} points in {:.2?}",
-            processed_points.len(),
-            downsampled_source_points_for_local.len(),
+            "Airy96 Frame {i}: Downsampled {} points → {} points",
+            processed_points_airy96.len(),
+            downsampled_source_points_for_local_mid70.len()
+        );
+        log::debug!(
+            "MID-70 Frame {i}: Downsampled {} points → {} points, Total Voxelization process {:.2?}",
+            processed_points_mid70.len(),
+            downsampled_source_points_for_local_mid70.len(),
             voxel_end
         );
         // --- Downsample processed points ---
 
         // --- Build voxel map for source points ---
         let build_map_start = std::time::Instant::now();
-        let source_voxel_map = build_voxel_map(
-            &downsampled_source_points_for_local,
-            LOCAL_MAP_VOXEL_SIZE,
-            NEIGHBOR_RANGE,
+        let source_voxel_map_airy96 = build_voxel_map(
+            &downsampled_source_points_for_local_airy96,
+            LOCAL_MAP_VOXEL_SIZE_AIRY96,
+            NEIGHBOR_RANGE_AIRY96,
             false,
         );
-        let source_voxel_map_for_global = build_voxel_map(
-            &downsampled_source_points_for_global,
-            GLOBAL_MAP_VOXEL_SIZE,
-            NEIGHBOR_RANGE,
+        let source_voxel_map_for_global_airy96 = build_voxel_map(
+            &downsampled_source_points_for_global_airy96,
+            GLOBAL_MAP_VOXEL_SIZE_AIRY96,
+            NEIGHBOR_RANGE_AIRY96,
+            false,
+        );
+
+        let source_voxel_map_mid70 = build_voxel_map(
+            &downsampled_source_points_for_local_mid70,
+            LOCAL_MAP_VOXEL_SIZE_MID70,
+            NEIGHBOR_RANGE_MID70,
+            false,
+        );
+        let source_voxel_map_for_global_mid70 = build_voxel_map(
+            &downsampled_source_points_for_global_mid70,
+            GLOBAL_MAP_VOXEL_SIZE_MID70,
+            NEIGHBOR_RANGE_MID70,
             false,
         );
         let build_map_end = build_map_start.elapsed();
@@ -354,20 +497,20 @@ fn main() -> Result<()> {
         if slam_map.local_voxel_map.voxel_map.is_empty() {
             log::debug!("Frame {i}: local map empty, skipping ICP");
         } else {
-            for _iter in 0..ICP_ITERATIONS {
+            for _iter in 0..ICP_ITERATIONS_AIRY96 {
                 // 対応点をピックアップ
                 // - source はローカル座標、target (local_voxel_map) はワールド座標
                 // - 現在の (R,t) 推定値で source をワールド変換してから近傍探索
                 let pickup_start = std::time::Instant::now();
                 let correspondences = pickup_valid_source_points(
-                    &source_voxel_map,
+                    &source_voxel_map_airy96,
                     &slam_map.local_voxel_map.voxel_map,
                     slam_map.local_voxel_map.config.index_voxel_size,
-                    SEARCH_RANGE,
-                    LOCAL_KNN_K,
-                    MAX_DIST_FACTOR,
-                    LOCAL_PLANE_POINT_DISTANCE_THRESHOLD_M,
-                    LOCAL_SOURCE_PLANE_SCORE_THRESHOLD,
+                    SEARCH_RANGE_AIRY96,
+                    LOCAL_KNN_K_AIRY96,
+                    MAX_DIST_FACTOR_AIRY96,
+                    LOCAL_PLANE_POINT_DISTANCE_THRESHOLD_M_AIRY96,
+                    LOCAL_SOURCE_PLANE_SCORE_THRESHOLD_AIRY96,
                     None,
                     None,
                     &r_mat,
@@ -411,7 +554,7 @@ fn main() -> Result<()> {
                 );
 
                 // RMSE が発散した場合は ICP 結果を棄却して予測姿勢に戻す
-                if rmse > ICP_RMSE_DIVERGE_THRESHOLD {
+                if rmse > ICP_RMSE_DIVERGE_THRESHOLD_AIRY96 {
                     log::warn!(
                         "ICP iter {_iter}: RMSE diverged ({rmse:.4}), reverting to \
                          {prediction_source} prediction"
@@ -423,7 +566,7 @@ fn main() -> Result<()> {
                 }
 
                 // if (prev_rmse - rmse).abs() < ICP_RMSE_THRESHOLD {
-                if rmse < ICP_RMSE_THRESHOLD {
+                if rmse < ICP_RMSE_THRESHOLD_AIRY96 {
                     log::debug!(
                         "ICP converged at iter {_iter} (|Δrmse|={:.2e})",
                         (prev_rmse - rmse).abs()
@@ -480,7 +623,7 @@ fn main() -> Result<()> {
             .to_degrees();
         frame_logs.push(FrameLog {
             frame_index: i,
-            timestamp: current_frame_start_time,
+            timestamp: current_frame_start_time_airy96,
             icp_ok,
             rmse: if prev_rmse.is_finite() {
                 Some(prev_rmse)
@@ -502,26 +645,26 @@ fn main() -> Result<()> {
         // ICP 収束後の最終姿勢 (r_mat, t_vec) でワールドマップに追加する。
         let global_source_points: Vec<Point3<f32>> =
             if slam_map.local_voxel_map.voxel_map.is_empty() {
-                downsampled_source_points_for_global.clone()
+                downsampled_source_points_for_global_airy96.clone()
             } else {
                 let valid = pickup_valid_source_points(
-                    &source_voxel_map_for_global,
+                    &source_voxel_map_for_global_airy96,
                     &slam_map.local_voxel_map.voxel_map,
                     slam_map.local_voxel_map.config.index_voxel_size,
-                    SEARCH_RANGE,
-                    GLOBAL_KNN_K,
-                    MAX_DIST_FACTOR,
-                    GLOBAL_PLANE_POINT_DISTANCE_THRESHOLD_M,
-                    GLOBAL_SOURCE_PLANE_SCORE_THRESHOLD,
-                    Some(GLOBAL_SOURCE_TO_PLANE_MAX_DISTANCE_M),
-                    Some(GLOBAL_MIN_PLANARITY),
+                    SEARCH_RANGE_AIRY96,
+                    GLOBAL_KNN_K_AIRY96,
+                    MAX_DIST_FACTOR_AIRY96,
+                    GLOBAL_PLANE_POINT_DISTANCE_THRESHOLD_M_AIRY96,
+                    GLOBAL_SOURCE_PLANE_SCORE_THRESHOLD_AIRY96,
+                    Some(GLOBAL_SOURCE_TO_PLANE_MAX_DISTANCE_M_AIRY96),
+                    Some(GLOBAL_MIN_PLANARITY_AIRY96),
                     &r_mat,
                     &t_vec,
                 );
                 log::debug!(
                     "Frame {i}: {} / {} source points passed plane filter for global map",
                     valid.len(),
-                    source_voxel_map_for_global.len(),
+                    source_voxel_map_for_global_airy96.len(),
                 );
                 valid.into_iter().map(|c| c.src_point).collect()
             };
@@ -533,18 +676,62 @@ fn main() -> Result<()> {
 
         // --- Update the LocalMap with the new frame's points ---
         slam_map.local_voxel_map.update_with_new_frame(
-            &downsampled_source_points_for_local,
+            &downsampled_source_points_for_local_airy96,
             &current_frame_info.current_global_pose,
         );
         // --- Update the LocalMap with the new frame's points ---
 
-        prev_frame_start_time = current_frame_start_time;
+        // --- Filter valid source points, then update the WorldMap ---
+        let global_source_points: Vec<Point3<f32>> =
+            if slam_map_mid70.local_voxel_map.voxel_map.is_empty() {
+                downsampled_source_points_for_global_mid70.clone()
+            } else {
+                let valid = pickup_valid_source_points(
+                    &source_voxel_map_for_global_mid70,
+                    &slam_map_mid70.local_voxel_map.voxel_map,
+                    slam_map_mid70.local_voxel_map.config.index_voxel_size,
+                    SEARCH_RANGE_MID70,
+                    GLOBAL_KNN_K_MID70,
+                    MAX_DIST_FACTOR_MID70,
+                    GLOBAL_PLANE_POINT_DISTANCE_THRESHOLD_M_MID70,
+                    GLOBAL_SOURCE_PLANE_SCORE_THRESHOLD_MID70,
+                    Some(GLOBAL_SOURCE_TO_PLANE_MAX_DISTANCE_M_MID70),
+                    Some(GLOBAL_MIN_PLANARITY_MID70),
+                    &r_mat,
+                    &t_vec,
+                );
+                log::debug!(
+                    "Frame {i}: {} / {} source points passed plane filter for global map",
+                    valid.len(),
+                    source_voxel_map_for_global_mid70.len(),
+                );
+                valid.into_iter().map(|c| c.src_point).collect()
+            };
+        slam_map_mid70.global_voxel_map.update_world_map(
+            &global_source_points,
+            &current_frame_info.current_global_pose,
+        );
+        // --- Filter valid source points, then update the WorldMap ---
+
+        // --- Update the LocalMap with the new frame's points ---
+        slam_map_mid70.local_voxel_map.update_with_new_frame(
+            &downsampled_source_points_for_local_mid70,
+            &current_frame_info.current_global_pose,
+        );
+        // --- Update the LocalMap with the new frame's points ---
+
+        prev_frame_start_time = current_frame_start_time_airy96;
     }
 
     // --- Save the final global voxel map to a PCD file ---
     let min_samples = slam_map.global_voxel_map.config.min_points_per_voxel as u64;
 
     let min_frames = slam_map
+        .global_voxel_map
+        .config
+        .min_observed_frames_per_voxel as u64;
+
+    let min_frames_mid70 = slam_map_mid70
         .global_voxel_map
         .config
         .min_observed_frames_per_voxel as u64;
@@ -557,8 +744,16 @@ fn main() -> Result<()> {
         .map(|cell| Point3::new(cell.mean.x, cell.mean.y, cell.mean.z))
         .collect();
 
+    let world_map_points_mid70: Vec<Point3<f32>> = slam_map_mid70
+        .global_voxel_map
+        .voxel_map
+        .values()
+        .filter(|cell| cell.sample_count >= min_samples && cell.observed_frames >= min_frames_mid70)
+        .map(|cell| Point3::new(cell.mean.x, cell.mean.y, cell.mean.z))
+        .collect();
+
     let downsampled_world_map_points =
-        voxel_downsample_points(&world_map_points, GLOBAL_MAP_VOXEL_SIZE);
+        voxel_downsample_points(&world_map_points, GLOBAL_MAP_VOXEL_SIZE_AIRY96);
     let downsampled_world_map_points_xyz: Vec<PointXYZ> = downsampled_world_map_points
         .iter()
         .map(|point| PointXYZ {
@@ -568,11 +763,22 @@ fn main() -> Result<()> {
         })
         .collect();
 
+    let downsampled_world_map_points_mid70 =
+        voxel_downsample_points(&world_map_points_mid70, GLOBAL_MAP_VOXEL_SIZE_MID70);
+    let downsampled_world_map_points_mid70_xyz: Vec<PointXYZ> = downsampled_world_map_points_mid70
+        .iter()
+        .map(|point| PointXYZ {
+            x: point.x,
+            y: point.y,
+            z: point.z,
+        })
+        .collect();
+
     let world_map_path = format!(
-        "{}/voxel-{}_world_map.pcd",
-        config.save_dir, GLOBAL_MAP_VOXEL_SIZE
+        "{}/airy96_voxel-{}_world_map.pcd",
+        SAVE_DIR, GLOBAL_MAP_VOXEL_SIZE_AIRY96
     );
-    std::fs::create_dir_all(&config.save_dir)?;
+    std::fs::create_dir_all(SAVE_DIR)?;
     save_pcd_xyz(&downsampled_world_map_points_xyz, &world_map_path)?;
     log::info!(
         "Saved downsampled world map: {} → {} points → {}",
@@ -580,10 +786,23 @@ fn main() -> Result<()> {
         downsampled_world_map_points_xyz.len(),
         world_map_path
     );
+
+    let world_map_path_mid70 = format!(
+        "{}/mid70_voxel-{}_world_map.pcd",
+        SAVE_DIR, GLOBAL_MAP_VOXEL_SIZE_MID70
+    );
+    std::fs::create_dir_all(SAVE_DIR)?;
+    save_pcd_xyz(&downsampled_world_map_points_mid70_xyz, &world_map_path_mid70)?;
+    log::info!(
+        "Saved downsampled world map: {} → {} points → {}",
+        world_map_points_mid70.len(),
+        downsampled_world_map_points_mid70_xyz.len(),
+        world_map_path_mid70
+    );
     // --- Save the final global voxel map to a PCD file ---
 
     // --- Save per-frame ICP logs to JSON ---
-    let frame_logs_path = format!("{}/frame_logs.json", config.save_dir);
+    let frame_logs_path = format!("{}/frame_logs.json", SAVE_DIR);
     let frame_logs_json = serde_json::to_string_pretty(&frame_logs)?;
     std::fs::write(&frame_logs_path, &frame_logs_json)?;
     log::info!(
@@ -599,20 +818,20 @@ fn main() -> Result<()> {
 fn print_usage() {
     println!(
         "Usage: re_lidar_slam [--sensor airy96|mid70] [--load-dir DIR] [--save-dir DIR]\n\
-         Defaults: --sensor airy96 --load-dir {LOAD_DIR} --save-dir {SAVE_DIR}"
+         Defaults: --sensor airy96 --load-dir {LOAD_DIR_AIRY96} --save-dir {SAVE_DIR}"
     );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AppConfig, LOAD_DIR, SAVE_DIR, SensorType};
+    use super::{AppConfig, LOAD_DIR_AIRY96, SAVE_DIR, SensorType};
 
     #[test]
     fn app_config_preserves_airy96_defaults() {
         let config = AppConfig::parse(Vec::new()).unwrap();
 
         assert_eq!(config.sensor_type, SensorType::Airy96);
-        assert_eq!(config.load_dir, LOAD_DIR);
+        assert_eq!(config.load_dir, LOAD_DIR_AIRY96);
         assert_eq!(config.save_dir, SAVE_DIR);
     }
 
