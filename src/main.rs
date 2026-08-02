@@ -152,32 +152,14 @@ const MAX_DIST_FOR_VOXEL_MAP_AIRY96: f32 = 40.0;
 // --- The parametrers for Airy 96 ---
 
 // --- The parametrers for Mid-70 ---
-const LOCAL_MAP_VOXEL_SIZE_MID70: f32 = 0.5; // m
-const GLOBAL_MAP_VOXEL_SIZE_MID70: f32 = 0.25; // m
+const GLOBAL_MAP_VOXEL_SIZE_MID70: f32 = 0.15; // m
+const GLOBAL_MAP_MIN_OBSERVED_FRAMES_MID70: usize = 2;
 
 const MAX_DIST_FOR_VOXEL_MAP_MID70: f32 = 150.0;
 
 const MIN_DIST_MID70: f32 = 0.5;
 const MAX_DIST_MID70: f32 = 150.0;
 
-const NEIGHBOR_RANGE_MID70: i32 = 3; // Voxel search range for nearest neighbor search
-
-const LOCAL_KNN_K_MID70: usize = 7;
-const GLOBAL_KNN_K_MID70: usize = 5; // Number of nearest neighbors for plane fitting (Default: 5)
-const SEARCH_RANGE_MID70: i32 = 2; // Voxel search range for nearest neighbor search
-const MAX_DIST_FACTOR_MID70: f32 = 2.5; // Maximum distance factor for nearest neighbor search (Prev: 3.0)
-// k近傍点が推定平面から離れてよい最大距離 [m]
-const LOCAL_PLANE_POINT_DISTANCE_THRESHOLD_M_MID70: f32 = 0.1;
-const GLOBAL_PLANE_POINT_DISTANCE_THRESHOLD_M_MID70: f32 = 0.1;
-const LOCAL_SOURCE_PLANE_SCORE_THRESHOLD_MID70: f32 = 0.90;
-const GLOBAL_SOURCE_PLANE_SCORE_THRESHOLD_MID70: f32 = 0.90;
-// GlobalMapへ追加するSource点と既存平面との最大距離 [m]
-const GLOBAL_SOURCE_TO_PLANE_MAX_DISTANCE_M_MID70: f32 = 0.015;
-const GLOBAL_MIN_PLANARITY_MID70: f32 = 0.15;
-
-const ICP_ITERATIONS_MID70: usize = 5; // Default: 5
-const ICP_RMSE_THRESHOLD_MID70: f32 = 0.033; // 収束判定: RMSE の変化量がこれ以下なら停止 // voxel size 0.2m の場合、0.07m くらいが妥当
-const ICP_RMSE_DIVERGE_THRESHOLD_MID70: f32 = 2.0; // 発散判定: RMSE がこれ以上なら結果棄却→予測姿勢にフォールバック
 // --- The parametrers for Mid-70 ---
 
 fn main() -> Result<()> {
@@ -285,27 +267,15 @@ fn main() -> Result<()> {
         local_voxel_map: LOCALMap::new(local_map_config),
     };
 
-    let local_map_config_mid70 = LocalMapConfig {
-        index_voxel_size: LOCAL_MAP_VOXEL_SIZE_MID70,
-        max_points_per_voxel: 20,
-        min_points_per_voxel: 5,
-        min_observed_frames_per_voxel: 3,
-        max_frames: 50,
-        max_distance: MAX_DIST_FOR_VOXEL_MAP_MID70,
-    };
-
     let global_map_config_mid70 = LocalMapConfig {
         index_voxel_size: GLOBAL_MAP_VOXEL_SIZE_MID70,
         max_points_per_voxel: 20,
         min_points_per_voxel: 2,
-        min_observed_frames_per_voxel: 2,
+        min_observed_frames_per_voxel: GLOBAL_MAP_MIN_OBSERVED_FRAMES_MID70,
         max_frames: 50,
         max_distance: MAX_DIST_FOR_VOXEL_MAP_MID70,
     };
-    let mut slam_map_mid70 = SLAMMap {
-        global_voxel_map: LOCALMap::new(global_map_config_mid70),
-        local_voxel_map: LOCALMap::new(local_map_config_mid70),
-    };
+    let mut mid70_global_voxel_map = LOCALMap::new(global_map_config_mid70);
     // <--- Initialize SLAM map --->
 
     let mut prev_frame_start_time: f64 = 0.0;
@@ -440,8 +410,6 @@ fn main() -> Result<()> {
             voxel_downsample_points(&processed_points_airy96, GLOBAL_MAP_VOXEL_SIZE_AIRY96);
         // let voxel_end = voxel_start.elapsed();
 
-        let downsampled_source_points_for_local_mid70 =
-            voxel_downsample_points(&processed_points_mid70, LOCAL_MAP_VOXEL_SIZE_MID70);
         let downsampled_source_points_for_global_mid70 =
             voxel_downsample_points(&processed_points_mid70, GLOBAL_MAP_VOXEL_SIZE_MID70);
         let voxel_end = voxel_start.elapsed();
@@ -454,7 +422,7 @@ fn main() -> Result<()> {
         log::debug!(
             "MID-70 Frame {i}: Downsampled {} points → {} points, Total Voxelization process {:.2?}",
             processed_points_mid70.len(),
-            downsampled_source_points_for_local_mid70.len(),
+            downsampled_source_points_for_global_mid70.len(),
             voxel_end
         );
         // --- Downsample processed points ---
@@ -474,18 +442,6 @@ fn main() -> Result<()> {
             false,
         );
 
-        let source_voxel_map_mid70 = build_voxel_map(
-            &downsampled_source_points_for_local_mid70,
-            LOCAL_MAP_VOXEL_SIZE_MID70,
-            NEIGHBOR_RANGE_MID70,
-            false,
-        );
-        let source_voxel_map_for_global_mid70 = build_voxel_map(
-            &downsampled_source_points_for_global_mid70,
-            GLOBAL_MAP_VOXEL_SIZE_MID70,
-            NEIGHBOR_RANGE_MID70,
-            false,
-        );
         let build_map_end = build_map_start.elapsed();
         log::debug!("Frame {i}: Built voxel map in {:.2?}", build_map_end);
         // --- Build voxel map for source points ---
@@ -624,12 +580,6 @@ fn main() -> Result<()> {
         // MID-70点群をAiry SLAMと同じWorld座標へ変換する姿勢
         let mid70_global_pose = &current_frame_info.current_global_pose * &airy_from_mid70;
 
-        let mid70_pose_f32 = mid70_global_pose.cast::<f32>();
-
-        let r_mat_mid70: Matrix3<f32> = mid70_pose_f32.fixed_view::<3, 3>(0, 0).into();
-
-        let t_vec_mid70: Vector3<f32> = mid70_pose_f32.fixed_view::<3, 1>(0, 3).into();
-
         // --- Record frame log ---
         let translation_m = (new_pos - prev_pos).norm();
         let delta_r = r64 * prev_r.transpose();
@@ -697,43 +647,18 @@ fn main() -> Result<()> {
         );
         // --- Update the LocalMap with the new frame's points ---
 
-        // --- Filter valid source points, then update the WorldMap ---
-        let global_source_points_mid70: Vec<Point3<f32>> =
-            if slam_map_mid70.local_voxel_map.voxel_map.is_empty() {
-                downsampled_source_points_for_global_mid70.clone()
-            } else {
-                let valid = pickup_valid_source_points(
-                    &source_voxel_map_for_global_mid70,
-                    &slam_map_mid70.local_voxel_map.voxel_map,
-                    slam_map_mid70.local_voxel_map.config.index_voxel_size,
-                    SEARCH_RANGE_MID70,
-                    GLOBAL_KNN_K_MID70,
-                    MAX_DIST_FACTOR_MID70,
-                    GLOBAL_PLANE_POINT_DISTANCE_THRESHOLD_M_MID70,
-                    GLOBAL_SOURCE_PLANE_SCORE_THRESHOLD_MID70,
-                    Some(GLOBAL_SOURCE_TO_PLANE_MAX_DISTANCE_M_MID70),
-                    Some(GLOBAL_MIN_PLANARITY_MID70),
-                    &r_mat_mid70,
-                    &t_vec_mid70,
-                );
-                log::debug!(
-                    "MID-70 Frame {i}: {} / {} source points passed plane filter for global map",
-                    valid.len(),
-                    source_voxel_map_for_global_mid70.len(),
-                );
-                valid.into_iter().map(|c| c.src_point).collect()
-            };
-        slam_map_mid70
-            .global_voxel_map
-            .update_world_map(&global_source_points_mid70, &mid70_global_pose);
-        // --- Filter valid source points, then update the WorldMap ---
-
-        // --- Update the LocalMap with the new frame's points ---
-        slam_map_mid70.local_voxel_map.update_with_new_frame(
-            &downsampled_source_points_for_local_mid70,
+        // Mid-70 の GlobalMap は可視化用で自己位置推定には使用しない。
+        // 平面対応点だけに限定すると細い構造物・エッジ・植生が欠落するため、
+        // 距離フィルタ・デスキュー・ダウンサンプル済みの全点を追加する。
+        // 一時的なノイズは最終出力時の複数フレーム観測条件で除外する。
+        log::debug!(
+            "MID-70 Frame {i}: adding {} downsampled points to dense global map",
+            downsampled_source_points_for_global_mid70.len(),
+        );
+        mid70_global_voxel_map.update_world_map(
+            &downsampled_source_points_for_global_mid70,
             &mid70_global_pose,
         );
-        // --- Update the LocalMap with the new frame's points ---
 
         prev_frame_start_time = current_frame_start_time_airy96;
     }
@@ -741,17 +666,14 @@ fn main() -> Result<()> {
     // --- Save the final global voxel map to a PCD file ---
     let min_samples = slam_map.global_voxel_map.config.min_points_per_voxel as u64;
 
-    let min_samples_mid70 = slam_map_mid70.global_voxel_map.config.min_points_per_voxel as u64;
+    let min_samples_mid70 = mid70_global_voxel_map.config.min_points_per_voxel as u64;
 
     let min_frames = slam_map
         .global_voxel_map
         .config
         .min_observed_frames_per_voxel as u64;
 
-    let min_frames_mid70 = slam_map_mid70
-        .global_voxel_map
-        .config
-        .min_observed_frames_per_voxel as u64;
+    let min_frames_mid70 = mid70_global_voxel_map.config.min_observed_frames_per_voxel as u64;
 
     let world_map_points: Vec<Point3<f32>> = slam_map
         .global_voxel_map
@@ -761,8 +683,7 @@ fn main() -> Result<()> {
         .map(|cell| Point3::new(cell.mean.x, cell.mean.y, cell.mean.z))
         .collect();
 
-    let world_map_points_mid70: Vec<Point3<f32>> = slam_map_mid70
-        .global_voxel_map
+    let world_map_points_mid70: Vec<Point3<f32>> = mid70_global_voxel_map
         .voxel_map
         .values()
         .filter(|cell| {
@@ -849,7 +770,8 @@ mod tests {
     use nalgebra::{Matrix4, Point3};
 
     use super::{
-        AppConfig, LOAD_DIR_AIRY96, MID70_ORIGIN_IN_AIRY_Z_M, SAVE_DIR, SensorType,
+        AppConfig, GLOBAL_MAP_MIN_OBSERVED_FRAMES_MID70, GLOBAL_MAP_VOXEL_SIZE_MID70,
+        LOAD_DIR_AIRY96, MID70_ORIGIN_IN_AIRY_Z_M, SAVE_DIR, SensorType,
         make_airy_from_mid70_extrinsic,
     };
 
@@ -902,6 +824,12 @@ mod tests {
         assert!((point_in_world.x - 10.0).abs() < 1e-12);
         assert!((point_in_world.y - 19.0).abs() < 1e-12);
         assert!((point_in_world.z - (30.0 + MID70_ORIGIN_IN_AIRY_Z_M)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn mid70_dense_map_preserves_selected_resolution_and_temporal_filter() {
+        assert!((GLOBAL_MAP_VOXEL_SIZE_MID70 - 0.15).abs() < f32::EPSILON);
+        assert_eq!(GLOBAL_MAP_MIN_OBSERVED_FRAMES_MID70, 2);
     }
 }
 
