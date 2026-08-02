@@ -155,6 +155,18 @@ const MAX_DIST_FOR_VOXEL_MAP_AIRY96: f32 = 40.0;
 const GLOBAL_MAP_VOXEL_SIZE_MID70: f32 = 0.15; // m
 const GLOBAL_MAP_MIN_OBSERVED_FRAMES_MID70: usize = 2;
 
+// Mid-70 は点分布が疎なため、平面検索用LocalMapを粗い1 mグリッドにまとめ、
+// 最大3 mの範囲から5近傍を探索する。
+const PLANE_FILTER_LOCAL_DOWNSAMPLE_SIZE_MID70: f32 = 0.5; // m
+const PLANE_FILTER_LOCAL_MAP_VOXEL_SIZE_MID70: f32 = 1.0; // m
+const PLANE_FILTER_SEARCH_RANGE_MID70: i32 = 3;
+const PLANE_FILTER_K_MID70: usize = 5;
+const PLANE_FILTER_MAX_DIST_FACTOR_MID70: f32 = 3.0;
+const PLANE_FILTER_NEIGHBOR_DISTANCE_THRESHOLD_MID70: f32 = 0.25; // m
+const PLANE_FILTER_SOURCE_SCORE_THRESHOLD_MID70: f32 = 0.85;
+const PLANE_FILTER_SOURCE_TO_PLANE_MAX_DISTANCE_MID70: f32 = 0.10; // m
+const PLANE_FILTER_MIN_PLANARITY_MID70: f32 = 0.05;
+
 const MAX_DIST_FOR_VOXEL_MAP_MID70: f32 = 150.0;
 
 const MIN_DIST_MID70: f32 = 0.5;
@@ -276,6 +288,16 @@ fn main() -> Result<()> {
         max_distance: MAX_DIST_FOR_VOXEL_MAP_MID70,
     };
     let mut mid70_global_voxel_map = LOCALMap::new(global_map_config_mid70);
+
+    let plane_filter_local_map_config_mid70 = LocalMapConfig {
+        index_voxel_size: PLANE_FILTER_LOCAL_MAP_VOXEL_SIZE_MID70,
+        max_points_per_voxel: 20,
+        min_points_per_voxel: 2,
+        min_observed_frames_per_voxel: 1,
+        max_frames: 50,
+        max_distance: MAX_DIST_FOR_VOXEL_MAP_MID70,
+    };
+    let mut mid70_plane_filter_local_map = LOCALMap::new(plane_filter_local_map_config_mid70);
     // <--- Initialize SLAM map --->
 
     let mut prev_frame_start_time: f64 = 0.0;
@@ -412,6 +434,10 @@ fn main() -> Result<()> {
 
         let downsampled_source_points_for_global_mid70 =
             voxel_downsample_points(&processed_points_mid70, GLOBAL_MAP_VOXEL_SIZE_MID70);
+        let downsampled_source_points_for_plane_filter_mid70 = voxel_downsample_points(
+            &processed_points_mid70,
+            PLANE_FILTER_LOCAL_DOWNSAMPLE_SIZE_MID70,
+        );
         let voxel_end = voxel_start.elapsed();
 
         log::debug!(
@@ -439,6 +465,12 @@ fn main() -> Result<()> {
             &downsampled_source_points_for_global_airy96,
             GLOBAL_MAP_VOXEL_SIZE_AIRY96,
             NEIGHBOR_RANGE_AIRY96,
+            false,
+        );
+        let source_voxel_map_for_global_mid70 = build_voxel_map(
+            &downsampled_source_points_for_global_mid70,
+            GLOBAL_MAP_VOXEL_SIZE_MID70,
+            0,
             false,
         );
 
@@ -579,6 +611,9 @@ fn main() -> Result<()> {
 
         // MID-70点群をAiry SLAMと同じWorld座標へ変換する姿勢
         let mid70_global_pose = &current_frame_info.current_global_pose * &airy_from_mid70;
+        let mid70_pose_f32 = mid70_global_pose.cast::<f32>();
+        let r_mat_mid70: Matrix3<f32> = mid70_pose_f32.fixed_view::<3, 3>(0, 0).into();
+        let t_vec_mid70: Vector3<f32> = mid70_pose_f32.fixed_view::<3, 1>(0, 3).into();
 
         // --- Record frame log ---
         let translation_m = (new_pos - prev_pos).norm();
@@ -647,16 +682,41 @@ fn main() -> Result<()> {
         );
         // --- Update the LocalMap with the new frame's points ---
 
-        // Mid-70 の GlobalMap は可視化用で自己位置推定には使用しない。
-        // 平面対応点だけに限定すると細い構造物・エッジ・植生が欠落するため、
-        // 距離フィルタ・デスキュー・ダウンサンプル済みの全点を追加する。
-        // 一時的なノイズは最終出力時の複数フレーム観測条件で除外する。
-        log::debug!(
-            "MID-70 Frame {i}: adding {} downsampled points to dense global map",
-            downsampled_source_points_for_global_mid70.len(),
-        );
-        mid70_global_voxel_map.update_world_map(
-            &downsampled_source_points_for_global_mid70,
+        // Mid-70は疎な点分布を考慮した広域近傍探索で平面点を選別する。
+        // 初回だけはLocalMapが空なので、地図のシードとして全点を追加する。
+        let global_source_points_mid70: Vec<Point3<f32>> = if mid70_plane_filter_local_map
+            .voxel_map
+            .is_empty()
+        {
+            downsampled_source_points_for_global_mid70.clone()
+        } else {
+            let valid = pickup_valid_source_points(
+                &source_voxel_map_for_global_mid70,
+                &mid70_plane_filter_local_map.voxel_map,
+                mid70_plane_filter_local_map.config.index_voxel_size,
+                PLANE_FILTER_SEARCH_RANGE_MID70,
+                PLANE_FILTER_K_MID70,
+                PLANE_FILTER_MAX_DIST_FACTOR_MID70,
+                PLANE_FILTER_NEIGHBOR_DISTANCE_THRESHOLD_MID70,
+                PLANE_FILTER_SOURCE_SCORE_THRESHOLD_MID70,
+                Some(PLANE_FILTER_SOURCE_TO_PLANE_MAX_DISTANCE_MID70),
+                Some(PLANE_FILTER_MIN_PLANARITY_MID70),
+                &r_mat_mid70,
+                &t_vec_mid70,
+            );
+            log::debug!(
+                "MID-70 Frame {i}: {} / {} source points passed sparse-cloud plane filter for global map",
+                valid.len(),
+                source_voxel_map_for_global_mid70.len(),
+            );
+            valid
+                .into_iter()
+                .map(|correspondence| correspondence.src_point)
+                .collect()
+        };
+        mid70_global_voxel_map.update_world_map(&global_source_points_mid70, &mid70_global_pose);
+        mid70_plane_filter_local_map.update_with_new_frame(
+            &downsampled_source_points_for_plane_filter_mid70,
             &mid70_global_pose,
         );
 
@@ -771,7 +831,10 @@ mod tests {
 
     use super::{
         AppConfig, GLOBAL_MAP_MIN_OBSERVED_FRAMES_MID70, GLOBAL_MAP_VOXEL_SIZE_MID70,
-        LOAD_DIR_AIRY96, MID70_ORIGIN_IN_AIRY_Z_M, SAVE_DIR, SensorType,
+        LOAD_DIR_AIRY96, MID70_ORIGIN_IN_AIRY_Z_M, PLANE_FILTER_K_MID70,
+        PLANE_FILTER_LOCAL_MAP_VOXEL_SIZE_MID70, PLANE_FILTER_MAX_DIST_FACTOR_MID70,
+        PLANE_FILTER_MIN_PLANARITY_MID70, PLANE_FILTER_SEARCH_RANGE_MID70,
+        PLANE_FILTER_SOURCE_TO_PLANE_MAX_DISTANCE_MID70, SAVE_DIR, SensorType,
         make_airy_from_mid70_extrinsic,
     };
 
@@ -830,6 +893,20 @@ mod tests {
     fn mid70_dense_map_preserves_selected_resolution_and_temporal_filter() {
         assert!((GLOBAL_MAP_VOXEL_SIZE_MID70 - 0.15).abs() < f32::EPSILON);
         assert_eq!(GLOBAL_MAP_MIN_OBSERVED_FRAMES_MID70, 2);
+    }
+
+    #[test]
+    fn mid70_sparse_plane_filter_uses_wide_relaxed_neighborhood() {
+        let search_extent_m =
+            PLANE_FILTER_LOCAL_MAP_VOXEL_SIZE_MID70 * PLANE_FILTER_SEARCH_RANGE_MID70 as f32;
+        let distance_cap_m =
+            PLANE_FILTER_LOCAL_MAP_VOXEL_SIZE_MID70 * PLANE_FILTER_MAX_DIST_FACTOR_MID70;
+
+        assert!((search_extent_m - 3.0).abs() < f32::EPSILON);
+        assert!((distance_cap_m - 3.0).abs() < f32::EPSILON);
+        assert_eq!(PLANE_FILTER_K_MID70, 5);
+        assert!((PLANE_FILTER_SOURCE_TO_PLANE_MAX_DISTANCE_MID70 - 0.10).abs() < f32::EPSILON);
+        assert!((PLANE_FILTER_MIN_PLANARITY_MID70 - 0.05).abs() < f32::EPSILON);
     }
 }
 
