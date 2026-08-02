@@ -23,20 +23,15 @@ cargo run --release --bin re_lidar_slam -- \
   --save-dir data/output/debug/07262026
  */
 
-const LOAD_DIR_AIRY96: &str = "data/input/05162026/outdoor09"; // /home/kenji/mnt/nfs/share/airy96/06212026/park05
-const LOAD_DIR_MID70: &str = "data/input/05162026/outdoor09"; // /home/kenji/mnt/nfs/share/airy96/06212026/park05
+const LOAD_DIR_AIRY96: &str = "data/output/debug/checked_pcd/airy"; // /home/kenji/mnt/nfs/share/airy96/06212026/park05
+const LOAD_DIR_AIRY96_IMU: &str = "data/input/08012026/08012026-airy96-mid70-07-church/airy/imu";
+const LOAD_DIR_MID70: &str = "data/output/debug/checked_pcd/mid-70"; // /home/kenji/mnt/nfs/share/airy96/06212026/park05
 const SAVE_DIR: &str = "data/output/debug/08012026";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SensorType {
     Airy96,
     Mid70,
-}
-
-impl SensorType {
-    fn uses_imu(self) -> bool {
-        matches!(self, Self::Airy96)
-    }
 }
 
 impl FromStr for SensorType {
@@ -109,7 +104,15 @@ impl AppConfig {
 struct ImuContext {
     samples: Vec<IMU>,
     imu_to_lidar: UnitQuaternion<f64>,
+    imu_to_mid70: UnitQuaternion<f64>,
 }
+
+const MID70_ORIGIN_IN_AIRY_X_M: f64 = 0.0;
+const MID70_ORIGIN_IN_AIRY_Y_M: f64 = 0.0;
+
+// Airy原点がMID-70原点より上にあるため負値。
+// 約30.3 mmは図面からの概算。実測値に置き換えるのが望ましい。
+const MID70_ORIGIN_IN_AIRY_Z_M: f64 = -0.06;
 
 // --- The parametrers for Airy 96 ---
 const MIN_DIST_AIRY96: f32 = 0.5;
@@ -223,11 +226,14 @@ fn main() -> Result<()> {
         pcd_dir_mid70
     );
 
-    let imu_context = if SensorType::Mid70.uses_imu() {
-        let imu_file = format!("{}/imu/imu_data.json", LOAD_DIR_AIRY96);
+    let airy_from_mid70 = make_airy_from_mid70_extrinsic();
+
+    let imu_context = {
+        let imu_file = format!("{}/imu_data.json", LOAD_DIR_AIRY96_IMU);
         let imu_data = load_imu_data(&imu_file)?;
         let imu_data = align_imu_timestamps(&imu_data); // Align IMU timestamps to seconds
         ensure!(!imu_data.is_empty(), "No IMU samples found in {imu_file}");
+        log::info!("Loaded {} IMU samples from {}", imu_data.len(), imu_file);
 
         // <--- IMU coord to LiDAR coord transformation --->
         let imu_to_lidar = UnitQuaternion::new_normalize(Quaternion::new(
@@ -236,15 +242,16 @@ fn main() -> Result<()> {
             IMU_TO_LIDAR_QUAT_Y,
             IMU_TO_LIDAR_QUAT_Z,
         ));
+        let airy_from_mid70_rotation =
+            UnitQuaternion::from_matrix(&airy_from_mid70.fixed_view::<3, 3>(0, 0).into_owned());
+        let imu_to_mid70 = airy_from_mid70_rotation.inverse() * imu_to_lidar;
         // <--- IMU coord to LiDAR coord transformation --->
 
         Some(ImuContext {
             samples: imu_data,
             imu_to_lidar,
+            imu_to_mid70,
         })
-    } else {
-        log::info!("Mid-70 mode: skipping IMU loading, IMU pose prediction, and deskew");
-        None
     };
     // <--- Loading each data --->
 
@@ -407,7 +414,7 @@ fn main() -> Result<()> {
                     &imu.samples,
                     current_frame_start_time_mid70,
                     current_frame_end_time_mid70,
-                    &imu.imu_to_lidar,
+                    &imu.imu_to_mid70,
                 );
                 // <--- Build rotation trajectory --->
 
@@ -415,7 +422,7 @@ fn main() -> Result<()> {
                 deskew_points(
                     &source_pcd_mid70,
                     &rotation_traj,
-                    &imu.imu_to_lidar,
+                    &imu.imu_to_mid70,
                     current_frame_start_time_mid70,
                     MIN_DIST_MID70,
                     MAX_DIST_MID70,
@@ -614,6 +621,15 @@ fn main() -> Result<()> {
         current_frame_info.current_velocity = new_velocity;
         // --- Update current frame info ---
 
+        // MID-70点群をAiry SLAMと同じWorld座標へ変換する姿勢
+        let mid70_global_pose = &current_frame_info.current_global_pose * &airy_from_mid70;
+
+        let mid70_pose_f32 = mid70_global_pose.cast::<f32>();
+
+        let r_mat_mid70: Matrix3<f32> = mid70_pose_f32.fixed_view::<3, 3>(0, 0).into();
+
+        let t_vec_mid70: Vector3<f32> = mid70_pose_f32.fixed_view::<3, 1>(0, 3).into();
+
         // --- Record frame log ---
         let translation_m = (new_pos - prev_pos).norm();
         let delta_r = r64 * prev_r.transpose();
@@ -682,7 +698,7 @@ fn main() -> Result<()> {
         // --- Update the LocalMap with the new frame's points ---
 
         // --- Filter valid source points, then update the WorldMap ---
-        let global_source_points: Vec<Point3<f32>> =
+        let global_source_points_mid70: Vec<Point3<f32>> =
             if slam_map_mid70.local_voxel_map.voxel_map.is_empty() {
                 downsampled_source_points_for_global_mid70.clone()
             } else {
@@ -697,8 +713,8 @@ fn main() -> Result<()> {
                     GLOBAL_SOURCE_PLANE_SCORE_THRESHOLD_MID70,
                     Some(GLOBAL_SOURCE_TO_PLANE_MAX_DISTANCE_M_MID70),
                     Some(GLOBAL_MIN_PLANARITY_MID70),
-                    &r_mat,
-                    &t_vec,
+                    &r_mat_mid70,
+                    &t_vec_mid70,
                 );
                 log::debug!(
                     "Frame {i}: {} / {} source points passed plane filter for global map",
@@ -708,7 +724,7 @@ fn main() -> Result<()> {
                 valid.into_iter().map(|c| c.src_point).collect()
             };
         slam_map_mid70.global_voxel_map.update_world_map(
-            &global_source_points,
+            &global_source_points_mid70,
             &current_frame_info.current_global_pose,
         );
         // --- Filter valid source points, then update the WorldMap ---
@@ -792,7 +808,10 @@ fn main() -> Result<()> {
         SAVE_DIR, GLOBAL_MAP_VOXEL_SIZE_MID70
     );
     std::fs::create_dir_all(SAVE_DIR)?;
-    save_pcd_xyz(&downsampled_world_map_points_mid70_xyz, &world_map_path_mid70)?;
+    save_pcd_xyz(
+        &downsampled_world_map_points_mid70_xyz,
+        &world_map_path_mid70,
+    )?;
     log::info!(
         "Saved downsampled world map: {} → {} points → {}",
         world_map_points_mid70.len(),
@@ -854,4 +873,22 @@ mod tests {
         assert_eq!(config.load_dir, "mid-input");
         assert_eq!(config.save_dir, "mid-output");
     }
+}
+
+fn make_airy_from_mid70_extrinsic() -> Matrix4<f64> {
+    let rotation = Matrix3::<f64>::new(0.0, 1.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0);
+
+    let translation = Vector3::<f64>::new(
+        MID70_ORIGIN_IN_AIRY_X_M,
+        MID70_ORIGIN_IN_AIRY_Y_M,
+        MID70_ORIGIN_IN_AIRY_Z_M,
+    );
+
+    let mut transform = Matrix4::<f64>::identity();
+    transform.fixed_view_mut::<3, 3>(0, 0).copy_from(&rotation);
+    transform
+        .fixed_view_mut::<3, 1>(0, 3)
+        .copy_from(&translation);
+
+    transform
 }

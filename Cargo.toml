@@ -2,6 +2,7 @@
 name = "re_lidar_slam"
 version = "0.1.0"
 edition = "2024"
+default-run = "re_lidar_slam"
 
 [dependencies]
 anyhow = "1"
