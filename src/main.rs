@@ -449,7 +449,7 @@ fn main() -> Result<()> {
         log::debug!(
             "Airy96 Frame {i}: Downsampled {} points → {} points",
             processed_points_airy96.len(),
-            downsampled_source_points_for_local_mid70.len()
+            downsampled_source_points_for_local_airy96.len()
         );
         log::debug!(
             "MID-70 Frame {i}: Downsampled {} points → {} points, Total Voxelization process {:.2?}",
@@ -678,7 +678,7 @@ fn main() -> Result<()> {
                     &t_vec,
                 );
                 log::debug!(
-                    "Frame {i}: {} / {} source points passed plane filter for global map",
+                    "Airy96 Frame {i}: {} / {} source points passed plane filter for global map",
                     valid.len(),
                     source_voxel_map_for_global_airy96.len(),
                 );
@@ -717,22 +717,21 @@ fn main() -> Result<()> {
                     &t_vec_mid70,
                 );
                 log::debug!(
-                    "Frame {i}: {} / {} source points passed plane filter for global map",
+                    "MID-70 Frame {i}: {} / {} source points passed plane filter for global map",
                     valid.len(),
                     source_voxel_map_for_global_mid70.len(),
                 );
                 valid.into_iter().map(|c| c.src_point).collect()
             };
-        slam_map_mid70.global_voxel_map.update_world_map(
-            &global_source_points_mid70,
-            &current_frame_info.current_global_pose,
-        );
+        slam_map_mid70
+            .global_voxel_map
+            .update_world_map(&global_source_points_mid70, &mid70_global_pose);
         // --- Filter valid source points, then update the WorldMap ---
 
         // --- Update the LocalMap with the new frame's points ---
         slam_map_mid70.local_voxel_map.update_with_new_frame(
             &downsampled_source_points_for_local_mid70,
-            &current_frame_info.current_global_pose,
+            &mid70_global_pose,
         );
         // --- Update the LocalMap with the new frame's points ---
 
@@ -741,6 +740,8 @@ fn main() -> Result<()> {
 
     // --- Save the final global voxel map to a PCD file ---
     let min_samples = slam_map.global_voxel_map.config.min_points_per_voxel as u64;
+
+    let min_samples_mid70 = slam_map_mid70.global_voxel_map.config.min_points_per_voxel as u64;
 
     let min_frames = slam_map
         .global_voxel_map
@@ -764,7 +765,9 @@ fn main() -> Result<()> {
         .global_voxel_map
         .voxel_map
         .values()
-        .filter(|cell| cell.sample_count >= min_samples && cell.observed_frames >= min_frames_mid70)
+        .filter(|cell| {
+            cell.sample_count >= min_samples_mid70 && cell.observed_frames >= min_frames_mid70
+        })
         .map(|cell| Point3::new(cell.mean.x, cell.mean.y, cell.mean.z))
         .collect();
 
@@ -843,7 +846,12 @@ fn print_usage() {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppConfig, LOAD_DIR_AIRY96, SAVE_DIR, SensorType};
+    use nalgebra::{Matrix4, Point3};
+
+    use super::{
+        AppConfig, LOAD_DIR_AIRY96, MID70_ORIGIN_IN_AIRY_Z_M, SAVE_DIR, SensorType,
+        make_airy_from_mid70_extrinsic,
+    };
 
     #[test]
     fn app_config_preserves_airy96_defaults() {
@@ -872,6 +880,28 @@ mod tests {
         assert_eq!(config.sensor_type, SensorType::Mid70);
         assert_eq!(config.load_dir, "mid-input");
         assert_eq!(config.save_dir, "mid-output");
+    }
+
+    #[test]
+    fn mid70_extrinsic_maps_points_into_airy_coordinates() {
+        let airy_from_mid70 = make_airy_from_mid70_extrinsic();
+        let point_in_mid70 = Point3::new(1.0, 0.0, 0.0);
+        let point_in_airy = airy_from_mid70.transform_point(&point_in_mid70);
+
+        assert!((point_in_airy.x - 0.0).abs() < 1e-12);
+        assert!((point_in_airy.y + 1.0).abs() < 1e-12);
+        assert!((point_in_airy.z - MID70_ORIGIN_IN_AIRY_Z_M).abs() < 1e-12);
+
+        let mut world_from_airy = Matrix4::<f64>::identity();
+        world_from_airy[(0, 3)] = 10.0;
+        world_from_airy[(1, 3)] = 20.0;
+        world_from_airy[(2, 3)] = 30.0;
+        let world_from_mid70 = world_from_airy * airy_from_mid70;
+        let point_in_world = world_from_mid70.transform_point(&point_in_mid70);
+
+        assert!((point_in_world.x - 10.0).abs() < 1e-12);
+        assert!((point_in_world.y - 19.0).abs() < 1e-12);
+        assert!((point_in_world.z - (30.0 + MID70_ORIGIN_IN_AIRY_Z_M)).abs() < 1e-12);
     }
 }
 
