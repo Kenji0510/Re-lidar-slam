@@ -11,13 +11,18 @@ use re_lidar_slam::{
     voxelization::voxel_downsample_points,
 };
 
-const LOAD_DIR: &str = "data/input/05162026/outdoor09"; // /home/kenji/mnt/nfs/share/airy96/06212026/park05
-const SAVE_DIR: &str = "data/output/debug/07182026";
+const LOAD_DIR: &str = "data/output/debug/checked_pcd/07/mid-70"; // /home/kenji/mnt/nfs/share/airy96/06212026/park05
+const SAVE_DIR: &str = "data/output/debug/08022026";
 
+// Mid-70 sparse-cloud preset.
+// The upper range matches the range used by the existing Mid-70 datasets.
 const MIN_DIST: f32 = 0.5;
-const MAX_DIST: f32 = 40.0;
+const MAX_DIST: f32 = 150.0;
 
-// IMU coordination to LiDAR coordination (Robosense 96 beam)
+// IMU coordination to LiDAR coordination.
+// NOTE: This is an extrinsic calibration value, not a point-density parameter.
+// Replace it with the measured IMU -> Mid-70 rotation when the sensors do not
+// share the same mounting orientation as the current Airy-96 setup.
 // Quaternion (x, y, z, w): -0.705437, 0.708767, -0.00246579, 0.00097028
 // Translation (x, y, z)  : 0.00425, 0.00418, -0.00446  [m]
 const IMU_TO_LIDAR_QUAT_X: f64 = -0.705437;
@@ -25,30 +30,33 @@ const IMU_TO_LIDAR_QUAT_Y: f64 = 0.708767;
 const IMU_TO_LIDAR_QUAT_Z: f64 = -0.00246579;
 const IMU_TO_LIDAR_QUAT_W: f64 = 0.00097028;
 
-const DOWNSAMPLE_VOXEL_SIZE: f32 = 0.1; // m
-const LOCAL_MAP_VOXEL_SIZE: f32 = 0.1; // m
-const GLOBAL_MAP_VOXEL_SIZE: f32 = 0.025; // m
+// Mid-70 is sparser than Airy-96. Keep more spatial support in each local-map
+// cell and search a wider area, while retaining a finer global-map output.
+const DOWNSAMPLE_VOXEL_SIZE: f32 = 0.5; // m
+const LOCAL_MAP_VOXEL_SIZE: f32 = 1.0; // m
+const GLOBAL_MAP_VOXEL_SIZE: f32 = 0.15; // m
 
-const NEIGHBOR_RANGE: i32 = 2; // Voxel search range for nearest neighbor search
+const NEIGHBOR_RANGE: i32 = 0; // Unused when build_voxel_map(..., is_target=false)
 
-const LOCAL_KNN_K: usize = 7;
-const GLOBAL_KNN_K: usize = 5; // Number of nearest neighbors for plane fitting (Default: 5)
-const SEARCH_RANGE: i32 = 2; // Voxel search range for nearest neighbor search
-const MAX_DIST_FACTOR: f32 = 2.5; // Maximum distance factor for nearest neighbor search (Prev: 3.0)
+const LOCAL_KNN_K: usize = 5;
+const GLOBAL_KNN_K: usize = 5;
+// 1.0 m cells x 3 cells, capped by MAX_DIST_FACTOR, gives a 3.0 m search radius.
+const SEARCH_RANGE: i32 = 3;
+const MAX_DIST_FACTOR: f32 = 3.0;
 // k近傍点が推定平面から離れてよい最大距離 [m]
-const LOCAL_PLANE_POINT_DISTANCE_THRESHOLD_M: f32 = 0.1;
-const GLOBAL_PLANE_POINT_DISTANCE_THRESHOLD_M: f32 = 0.1;
-const LOCAL_SOURCE_PLANE_SCORE_THRESHOLD: f32 = 0.90;
-const GLOBAL_SOURCE_PLANE_SCORE_THRESHOLD: f32 = 0.90;
+const LOCAL_PLANE_POINT_DISTANCE_THRESHOLD_M: f32 = 0.25;
+const GLOBAL_PLANE_POINT_DISTANCE_THRESHOLD_M: f32 = 0.25;
+const LOCAL_SOURCE_PLANE_SCORE_THRESHOLD: f32 = 0.85;
+const GLOBAL_SOURCE_PLANE_SCORE_THRESHOLD: f32 = 0.65;
 // GlobalMapへ追加するSource点と既存平面との最大距離 [m]
-const GLOBAL_SOURCE_TO_PLANE_MAX_DISTANCE_M: f32 = 0.015;
-const GLOBAL_MIN_PLANARITY: f32 = 0.15;
+const GLOBAL_SOURCE_TO_PLANE_MAX_DISTANCE_M: f32 = 0.10;
+const GLOBAL_MIN_PLANARITY: f32 = 0.05;
 
-const ICP_ITERATIONS: usize = 5; // Default: 5
-const ICP_RMSE_THRESHOLD: f32 = 0.033; // 収束判定: RMSE の変化量がこれ以下なら停止 // voxel size 0.2m の場合、0.07m くらいが妥当
-const ICP_RMSE_DIVERGE_THRESHOLD: f32 = 2.0; // 発散判定: RMSE がこれ以上なら結果棄却→IMU予測にフォールバック
+const ICP_ITERATIONS: usize = 8;
+const ICP_RMSE_THRESHOLD: f32 = 0.10; // Absolute point-to-plane RMSE convergence threshold [m]
+const ICP_RMSE_DIVERGE_THRESHOLD: f32 = 1.0; // Reject ICP and fall back to IMU prediction [m]
 
-const MAX_DIST_FOR_VOXEL_MAP: f32 = 40.0;
+const MAX_DIST_FOR_VOXEL_MAP: f32 = 150.0;
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
@@ -174,7 +182,7 @@ fn main() -> Result<()> {
         // --- Downsample deskewed points ---
         let voxel_start = std::time::Instant::now();
         let downsampled_source_points_for_local =
-            voxel_downsample_points(&deskewed_points, LOCAL_MAP_VOXEL_SIZE);
+            voxel_downsample_points(&deskewed_points, DOWNSAMPLE_VOXEL_SIZE);
         let downsampled_source_points_for_global =
             voxel_downsample_points(&deskewed_points, GLOBAL_MAP_VOXEL_SIZE);
         let voxel_end = voxel_start.elapsed();
@@ -190,7 +198,7 @@ fn main() -> Result<()> {
         let build_map_start = std::time::Instant::now();
         let source_voxel_map = build_voxel_map(
             &downsampled_source_points_for_local,
-            LOCAL_MAP_VOXEL_SIZE,
+            DOWNSAMPLE_VOXEL_SIZE,
             NEIGHBOR_RANGE,
             false,
         );
