@@ -10,8 +10,8 @@ use re_lidar_slam::{
     types::PointXYZIT,
 };
 
-const LOAD_DIR_AIRY96: &str = "data/input/08012026/08012026-airy96-mid70-07-church/airy/pcd";
-const LOAD_DIR_MID70: &str = "data/input/08012026/08012026-airy96-mid70-07-church/mid-70/pcd";
+const LOAD_DIR_AIRY96: &str = "data/input/08012026/08012026-airy96-mid70-08-church/airy/pcd";
+const LOAD_DIR_MID70: &str = "data/input/08012026/08012026-airy96-mid70-08-church/mid-70/pcd";
 
 const OUTPUT_ROOT: &str = "data/output/debug/checked_pcd";
 const OUTPUT_DIR_AIRY96: &str = "data/output/debug/checked_pcd/airy/pcd";

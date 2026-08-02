@@ -24,7 +24,7 @@ cargo run --release --bin re_lidar_slam -- \
  */
 
 const LOAD_DIR_AIRY96: &str = "data/output/debug/checked_pcd/airy"; // /home/kenji/mnt/nfs/share/airy96/06212026/park05
-const LOAD_DIR_AIRY96_IMU: &str = "data/input/08012026/08012026-airy96-mid70-07-church/airy/imu";
+const LOAD_DIR_AIRY96_IMU: &str = "data/input/08012026/08012026-airy96-mid70-08-church/airy/imu";
 const LOAD_DIR_MID70: &str = "data/output/debug/checked_pcd/mid-70"; // /home/kenji/mnt/nfs/share/airy96/06212026/park05
 const SAVE_DIR: &str = "data/output/debug/08012026";
 
@@ -163,7 +163,7 @@ const PLANE_FILTER_SEARCH_RANGE_MID70: i32 = 3;
 const PLANE_FILTER_K_MID70: usize = 5;
 const PLANE_FILTER_MAX_DIST_FACTOR_MID70: f32 = 3.0;
 const PLANE_FILTER_NEIGHBOR_DISTANCE_THRESHOLD_MID70: f32 = 0.25; // m
-const PLANE_FILTER_SOURCE_SCORE_THRESHOLD_MID70: f32 = 0.85;
+const PLANE_FILTER_SOURCE_SCORE_THRESHOLD_MID70: f32 = 0.65;
 const PLANE_FILTER_SOURCE_TO_PLANE_MAX_DISTANCE_MID70: f32 = 0.10; // m
 const PLANE_FILTER_MIN_PLANARITY_MID70: f32 = 0.05;
 
