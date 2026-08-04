@@ -11,27 +11,30 @@ use re_lidar_slam::{
     voxelization::voxel_downsample_points,
 };
 
-const LOAD_DIR: &str = "data/output/debug/checked_pcd/07/mid-70"; // /home/kenji/mnt/nfs/share/airy96/06212026/park05
-const SAVE_DIR: &str = "data/output/debug/08022026";
+const LOAD_DIR: &str = "data/input/08032026/08012026-airy96-mid70-05-road/mid-70"; // /home/kenji/mnt/nfs/share/airy96/06212026/park05
+const SAVE_DIR: &str = "data/output/debug/08032026";
 
 // Mid-70 sparse-cloud preset.
 // The upper range matches the range used by the existing Mid-70 datasets.
 const MIN_DIST: f32 = 0.5;
 const MAX_DIST: f32 = 150.0;
 
-// IMU coordination to LiDAR coordination.
-// NOTE: This is an extrinsic calibration value, not a point-density parameter.
-// Replace it with the measured IMU -> Mid-70 rotation when the sensors do not
-// share the same mounting orientation as the current Airy-96 setup.
+// Airy-96内蔵IMU座標からAiry-96 LiDAR座標への外部回転。
 // Quaternion (x, y, z, w): -0.705437, 0.708767, -0.00246579, 0.00097028
 // Translation (x, y, z)  : 0.00425, 0.00418, -0.00446  [m]
-const IMU_TO_LIDAR_QUAT_X: f64 = -0.705437;
-const IMU_TO_LIDAR_QUAT_Y: f64 = 0.708767;
-const IMU_TO_LIDAR_QUAT_Z: f64 = -0.00246579;
-const IMU_TO_LIDAR_QUAT_W: f64 = 0.00097028;
+const IMU_TO_AIRY96_QUAT_X: f64 = -0.705437;
+const IMU_TO_AIRY96_QUAT_Y: f64 = 0.708767;
+const IMU_TO_AIRY96_QUAT_Z: f64 = -0.00246579;
+const IMU_TO_AIRY96_QUAT_W: f64 = 0.00097028;
 
-// Mid-70 is sparser than Airy-96. Keep more spatial support in each local-map
-// cell and search a wider area, while retaining a finer global-map output.
+// Mid-70原点をAiry-96座標で表した位置。回転変換の導出には回転成分のみを使う。
+const MID70_ORIGIN_IN_AIRY96_X_M: f64 = 0.0;
+const MID70_ORIGIN_IN_AIRY96_Y_M: f64 = 0.0;
+const MID70_ORIGIN_IN_AIRY96_Z_M: f64 = -0.06;
+
+// Mid-70 is sparser than Airy-96. Keep enough spatial support in each local-map
+// cell for stable pose estimation; the stricter filters below are used to keep
+// wall/ground boundary points out of the global map.
 const DOWNSAMPLE_VOXEL_SIZE: f32 = 0.5; // m
 const LOCAL_MAP_VOXEL_SIZE: f32 = 1.0; // m
 const GLOBAL_MAP_VOXEL_SIZE: f32 = 0.15; // m
@@ -40,17 +43,19 @@ const NEIGHBOR_RANGE: i32 = 0; // Unused when build_voxel_map(..., is_target=fal
 
 const LOCAL_KNN_K: usize = 5;
 const GLOBAL_KNN_K: usize = 5;
-// 1.0 m cells x 3 cells, capped by MAX_DIST_FACTOR, gives a 3.0 m search radius.
+// 1.0 m cells x 3 cells gives a 3.0 m search radius.
 const SEARCH_RANGE: i32 = 3;
 const MAX_DIST_FACTOR: f32 = 3.0;
 // k近傍点が推定平面から離れてよい最大距離 [m]
 const LOCAL_PLANE_POINT_DISTANCE_THRESHOLD_M: f32 = 0.25;
-const GLOBAL_PLANE_POINT_DISTANCE_THRESHOLD_M: f32 = 0.25;
+const GLOBAL_PLANE_POINT_DISTANCE_THRESHOLD_M: f32 = 0.15;
 const LOCAL_SOURCE_PLANE_SCORE_THRESHOLD: f32 = 0.85;
-const GLOBAL_SOURCE_PLANE_SCORE_THRESHOLD: f32 = 0.65;
-// GlobalMapへ追加するSource点と既存平面との最大距離 [m]
-const GLOBAL_SOURCE_TO_PLANE_MAX_DISTANCE_M: f32 = 0.10;
-const GLOBAL_MIN_PLANARITY: f32 = 0.05;
+const GLOBAL_SOURCE_PLANE_SCORE_THRESHOLD: f32 = 0.85;
+// Source点と推定平面との最大距離 [m]
+const GLOBAL_SOURCE_TO_PLANE_MAX_DISTANCE_M: f32 = 0.06;
+// Wall/ground edges tend to form line-like or mixed neighborhoods. Reject them
+// during global-map insertion.
+const GLOBAL_MIN_PLANARITY: f32 = 0.15;
 
 const ICP_ITERATIONS: usize = 8;
 const ICP_RMSE_THRESHOLD: f32 = 0.10; // Absolute point-to-plane RMSE convergence threshold [m]
@@ -84,14 +89,8 @@ fn main() -> Result<()> {
     let imu_data = align_imu_timestamps(&imu_data); // Align IMU timestamps to seconds
     // <--- Loading each data --->
 
-    // <--- IMU coord to LiDAR coord transformation --->
-    let imu_to_lidar = UnitQuaternion::new_normalize(Quaternion::new(
-        IMU_TO_LIDAR_QUAT_W,
-        IMU_TO_LIDAR_QUAT_X,
-        IMU_TO_LIDAR_QUAT_Y,
-        IMU_TO_LIDAR_QUAT_Z,
-    ));
-    // <--- IMU coord to LiDAR coord transformation --->
+    // Airy-96内蔵IMUの角速度・加速度をMid-70座標へ変換する回転。
+    let imu_to_mid70 = make_imu_to_mid70_rotation();
 
     // <--- Initialize current frame info --->
     let mut current_frame_info = CurrentFrameInfo {
@@ -151,7 +150,7 @@ fn main() -> Result<()> {
         // <--- Predict pose by IMU --->
         let pose_prediction = predict_pose_by_imu(
             &imu_data,
-            &imu_to_lidar,
+            &imu_to_mid70,
             &current_frame_info.current_global_pose,
             &current_frame_info.current_velocity,
             prev_frame_start_time,
@@ -164,7 +163,7 @@ fn main() -> Result<()> {
             &imu_data,
             current_frame_start_time,
             current_frame_end_time,
-            &imu_to_lidar,
+            &imu_to_mid70,
         );
         // <--- Build rotation trajectory --->
 
@@ -172,7 +171,7 @@ fn main() -> Result<()> {
         let deskewed_points = deskew_points(
             &source_pcd,
             &rotation_traj,
-            &imu_to_lidar,
+            &imu_to_mid70,
             current_frame_start_time,
             MIN_DIST,
             MAX_DIST,
@@ -462,4 +461,77 @@ fn main() -> Result<()> {
     // --- Save per-frame ICP logs to JSON ---
 
     Ok(())
+}
+
+/// Mid-70座標の点をAiry-96座標へ写す外部変換 `T_airy96_from_mid70`。
+fn make_airy96_from_mid70_extrinsic() -> Matrix4<f64> {
+    let rotation = Matrix3::<f64>::new(0.0, 1.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0);
+    let translation = Vector3::<f64>::new(
+        MID70_ORIGIN_IN_AIRY96_X_M,
+        MID70_ORIGIN_IN_AIRY96_Y_M,
+        MID70_ORIGIN_IN_AIRY96_Z_M,
+    );
+
+    let mut transform = Matrix4::<f64>::identity();
+    transform.fixed_view_mut::<3, 3>(0, 0).copy_from(&rotation);
+    transform
+        .fixed_view_mut::<3, 1>(0, 3)
+        .copy_from(&translation);
+    transform
+}
+
+/// Airy-96内蔵IMU座標からMid-70座標への回転を返す。
+///
+/// `R_mid70_from_imu = R_mid70_from_airy96 * R_airy96_from_imu`
+fn make_imu_to_mid70_rotation() -> UnitQuaternion<f64> {
+    let imu_to_airy96 = UnitQuaternion::new_normalize(Quaternion::new(
+        IMU_TO_AIRY96_QUAT_W,
+        IMU_TO_AIRY96_QUAT_X,
+        IMU_TO_AIRY96_QUAT_Y,
+        IMU_TO_AIRY96_QUAT_Z,
+    ));
+    let airy96_from_mid70 = make_airy96_from_mid70_extrinsic();
+    let airy96_from_mid70_rotation =
+        UnitQuaternion::from_matrix(&airy96_from_mid70.fixed_view::<3, 3>(0, 0).into_owned());
+
+    airy96_from_mid70_rotation.inverse() * imu_to_airy96
+}
+
+#[cfg(test)]
+mod tests {
+    use nalgebra::{Point3, Vector3};
+
+    use super::{
+        MID70_ORIGIN_IN_AIRY96_Z_M, make_airy96_from_mid70_extrinsic, make_imu_to_mid70_rotation,
+    };
+
+    #[test]
+    fn mid70_extrinsic_maps_axes_into_airy96_coordinates() {
+        let airy96_from_mid70 = make_airy96_from_mid70_extrinsic();
+        let mid70_x = Point3::new(1.0, 0.0, 0.0);
+        let airy96_point = airy96_from_mid70.transform_point(&mid70_x);
+
+        assert!((airy96_point.x - 0.0).abs() < 1e-12);
+        assert!((airy96_point.y + 1.0).abs() < 1e-12);
+        assert!((airy96_point.z - MID70_ORIGIN_IN_AIRY96_Z_M).abs() < 1e-12);
+    }
+
+    #[test]
+    fn imu_to_mid70_rotation_composes_back_to_airy96_rotation() {
+        let imu_vector = Vector3::new(0.3, -0.4, 0.5);
+        let imu_to_mid70 = make_imu_to_mid70_rotation();
+        let airy96_from_mid70 = make_airy96_from_mid70_extrinsic();
+        let airy96_from_mid70_rotation = airy96_from_mid70.fixed_view::<3, 3>(0, 0).into_owned();
+
+        let via_mid70 = airy96_from_mid70_rotation * (imu_to_mid70 * imu_vector);
+        let imu_to_airy96 = super::UnitQuaternion::new_normalize(super::Quaternion::new(
+            super::IMU_TO_AIRY96_QUAT_W,
+            super::IMU_TO_AIRY96_QUAT_X,
+            super::IMU_TO_AIRY96_QUAT_Y,
+            super::IMU_TO_AIRY96_QUAT_Z,
+        ));
+        let direct = imu_to_airy96 * imu_vector;
+
+        assert!((via_mid70 - direct).norm() < 1e-12);
+    }
 }
