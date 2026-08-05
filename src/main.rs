@@ -48,14 +48,14 @@ const SEARCH_RANGE: i32 = 3;
 const MAX_DIST_FACTOR: f32 = 3.0;
 // k近傍点が推定平面から離れてよい最大距離 [m]
 const LOCAL_PLANE_POINT_DISTANCE_THRESHOLD_M: f32 = 0.25;
-const GLOBAL_PLANE_POINT_DISTANCE_THRESHOLD_M: f32 = 0.15;
+const GLOBAL_PLANE_POINT_DISTANCE_THRESHOLD_M: f32 = 0.20;
 const LOCAL_SOURCE_PLANE_SCORE_THRESHOLD: f32 = 0.85;
-const GLOBAL_SOURCE_PLANE_SCORE_THRESHOLD: f32 = 0.85;
+const GLOBAL_SOURCE_PLANE_SCORE_THRESHOLD: f32 = 0.75;
 // Source点と推定平面との最大距離 [m]
-const GLOBAL_SOURCE_TO_PLANE_MAX_DISTANCE_M: f32 = 0.06;
+const GLOBAL_SOURCE_TO_PLANE_MAX_DISTANCE_M: f32 = 0.08;
 // Wall/ground edges tend to form line-like or mixed neighborhoods. Reject them
-// during global-map insertion.
-const GLOBAL_MIN_PLANARITY: f32 = 0.15;
+// during global-map insertion, while retaining sparse Mid-70 observations.
+const GLOBAL_MIN_PLANARITY: f32 = 0.10;
 
 const ICP_ITERATIONS: usize = 8;
 const ICP_RMSE_THRESHOLD: f32 = 0.10; // Absolute point-to-plane RMSE convergence threshold [m]
