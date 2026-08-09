@@ -11,8 +11,8 @@ use re_lidar_slam::{
     voxelization::voxel_downsample_points,
 };
 
-const LOAD_DIR: &str = "data/input/08032026/08012026-airy96-mid70-05-road/mid-70"; // /home/kenji/mnt/nfs/share/airy96/06212026/park05
-const SAVE_DIR: &str = "data/output/debug/08032026";
+const LOAD_DIR: &str = "data/input/08082026/08012026-airy96-mid70-07/mid-70"; // /home/kenji/mnt/nfs/share/airy96/06212026/park05
+const SAVE_DIR: &str = "data/output/debug/08082026";
 
 // Mid-70 sparse-cloud preset.
 // The upper range matches the range used by the existing Mid-70 datasets.
@@ -35,9 +35,9 @@ const MID70_ORIGIN_IN_AIRY96_Z_M: f64 = -0.06;
 // Mid-70 is sparser than Airy-96. Keep enough spatial support in each local-map
 // cell for stable pose estimation; the stricter filters below are used to keep
 // wall/ground boundary points out of the global map.
-const DOWNSAMPLE_VOXEL_SIZE: f32 = 0.5; // m
-const LOCAL_MAP_VOXEL_SIZE: f32 = 1.0; // m
-const GLOBAL_MAP_VOXEL_SIZE: f32 = 0.15; // m
+const DOWNSAMPLE_VOXEL_SIZE: f32 = 0.25; // m
+const LOCAL_MAP_VOXEL_SIZE: f32 = 0.25; // m
+const GLOBAL_MAP_VOXEL_SIZE: f32 = 0.05; // m
 
 const NEIGHBOR_RANGE: i32 = 0; // Unused when build_voxel_map(..., is_target=false)
 
