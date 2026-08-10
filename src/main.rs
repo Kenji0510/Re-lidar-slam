@@ -11,7 +11,7 @@ use re_lidar_slam::{
     voxelization::voxel_downsample_points,
 };
 
-const LOAD_DIR: &str = "data/input/08082026/08012026-airy96-mid70-07/mid-70"; // /home/kenji/mnt/nfs/share/airy96/06212026/park05
+const LOAD_DIR: &str = "data/input/08082026/08012026-airy96-mid70-06/mid-70"; // /home/kenji/mnt/nfs/share/airy96/06212026/park05
 const SAVE_DIR: &str = "data/output/debug/08082026";
 
 // Mid-70 sparse-cloud preset.

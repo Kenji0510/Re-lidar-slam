@@ -1,8 +1,8 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 
 use nalgebra::{Matrix3, Matrix4, Point3, Vector3};
 use rayon::prelude::*;
-use std::collections::HashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct VoxelKey {
@@ -60,10 +60,12 @@ pub struct VoxelCell {
 pub struct FrameEntry {
     pub frame_id: u64,
     pub origin: Point3<f32>,
-    pub dirty_keys: HashSet<VoxelKey>,
+    pub dirty_keys: FxHashSet<VoxelKey>,
 }
 
-pub type VoxelMap = HashMap<VoxelKey, VoxelCell>;
+/// VoxelKey is generated internally from trusted point-cloud coordinates, so a
+/// fast deterministic hasher is preferable to HashMap's HashDoS-resistant one.
+pub type VoxelMap = FxHashMap<VoxelKey, VoxelCell>;
 
 pub struct LOCALMap {
     pub voxel_map: VoxelMap,
@@ -102,7 +104,8 @@ impl LOCALMap {
             })
             .collect();
 
-        let mut frame_voxels: HashMap<VoxelKey, (Vector3<f32>, usize)> = HashMap::new();
+        let mut frame_voxels: FxHashMap<VoxelKey, (Vector3<f32>, usize)> =
+            FxHashMap::default();
 
         for (key, point) in world_pts {
             frame_voxels
@@ -114,7 +117,7 @@ impl LOCALMap {
                 .or_insert((point.coords, 1));
         }
 
-        // HashMap への挿入は順次（排他アクセスが必要）
+        // VoxelMap への挿入は順次（排他アクセスが必要）
         // for (key, p_world) in world_pts {
         //     match self.voxel_map.entry(key) {
         //         std::collections::hash_map::Entry::Vacant(e) => {
@@ -300,7 +303,7 @@ pub fn build_voxel_map(
     neighbor_range: i32,
     is_target: bool,
 ) -> VoxelMap {
-    let mut voxel_map = VoxelMap::new();
+    let mut voxel_map = VoxelMap::default();
 
     for p in points {
         let key = voxel_key(p, voxel_size);
