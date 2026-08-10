@@ -206,20 +206,22 @@ pub struct PointCorrespondence<'a> {
     pub plane_d: f32,
 }
 
-/// query_point に近い順に最大 `k` 個の target_map セルを返す。
-/// 返り値: Vec<(&VoxelCell, f32)> — (セル参照, 距離の二乗)
-fn find_k_nearest_target_voxels<'a>(
+/// query_point に近い順に `K` 個の target_map セルを返す。
+///
+/// 候補全件の Vec とソートは作らず、固定長配列上で近い `K` 件だけを
+/// 挿入ソートする。`K` 個未満しか見つからなければ None。
+fn find_k_nearest_target_voxels<'a, const K: usize>(
     query_point: &Point3<f32>,
     target_map: &'a VoxelMap,
     voxel_size: f32,
     search_range: i32,
     max_dist_sq: f32,
-    k: usize,
-) -> Vec<(&'a VoxelCell, f32)> {
-    let base_key = voxel_key(query_point, voxel_size);
+) -> Option<[(&'a VoxelCell, f32); K]> {
+    assert!(K > 0, "K must be greater than zero");
 
-    // (dist_sq, cell) を収集してから距離順ソート
-    let mut candidates: Vec<(&VoxelCell, f32)> = Vec::new();
+    let base_key = voxel_key(query_point, voxel_size);
+    let mut nearest: Option<[(&VoxelCell, f32); K]> = None;
+    let mut nearest_len = 0;
 
     for dz in -search_range..=search_range {
         for dy in -search_range..=search_range {
@@ -238,15 +240,38 @@ fn find_k_nearest_target_voxels<'a>(
                 let dist_sq = diff.dot(&diff);
 
                 if dist_sq < max_dist_sq {
-                    candidates.push((target_cell, dist_sq));
+                    let candidate = (target_cell, dist_sq);
+
+                    let Some(entries) = nearest.as_mut() else {
+                        // 最初の候補で配列を安全に初期化する。未使用要素の値は
+                        // nearest_len で除外され、K 個揃うまでにすべて上書きされる。
+                        nearest = Some([candidate; K]);
+                        nearest_len = 1;
+                        continue;
+                    };
+
+                    let insert_at = (0..nearest_len)
+                        .find(|&i| dist_sq < entries[i].1)
+                        .unwrap_or(nearest_len);
+
+                    if nearest_len < K {
+                        for i in (insert_at..nearest_len).rev() {
+                            entries[i + 1] = entries[i];
+                        }
+                        entries[insert_at] = candidate;
+                        nearest_len += 1;
+                    } else if insert_at < K {
+                        for i in (insert_at..K.saturating_sub(1)).rev() {
+                            entries[i + 1] = entries[i];
+                        }
+                        entries[insert_at] = candidate;
+                    }
                 }
             }
         }
     }
 
-    candidates.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-    candidates.truncate(k);
-    candidates
+    if nearest_len == K { nearest } else { None }
 }
 
 /// source_map の各点について target_map から k 近傍セルを探し、
@@ -260,12 +285,11 @@ fn find_k_nearest_target_voxels<'a>(
 /// `r_mat` / `t_vec` は現在の ICP 推定姿勢で、対応点探索時に source を
 /// ワールド座標に変換するために使う。
 /// 返り値の `src_point` は**ローカル座標**（ICP ヤコビアン計算用）。
-pub fn pickup_valid_source_points<'a>(
+pub fn pickup_valid_source_points<'a, const K: usize>(
     source_map: &VoxelMap,
     target_map: &'a VoxelMap,
     target_voxel_size: f32,
     search_range: i32,
-    k: usize,
     max_dist_factor: f32,
     plane_point_distance_threshold: f32,
     source_plane_score_threshold: f32,
@@ -284,30 +308,31 @@ pub fn pickup_valid_source_points<'a>(
             // ローカル座標 → ワールド座標（現在の (R,t) 推定値を使用）
             let query_point = Point3::from(r_mat * src_point.coords + t_vec);
 
-            let neighbors = find_k_nearest_target_voxels(
+            let neighbors = find_k_nearest_target_voxels::<K>(
                 &query_point,
                 target_map,
                 target_voxel_size,
                 search_range,
                 max_neighbor_dist_sq,
-                k,
-            );
-
-            // 条件1: k 個揃っているか
-            if neighbors.len() < k {
-                return None;
-            }
+            )?;
 
             // 条件2: k 番目（最遠）が遠すぎないか
-            if neighbors.last().unwrap().1 > max_neighbor_dist_sq {
+            if neighbors
+                .last()
+                .is_some_and(|(_, dist_sq)| *dist_sq > max_neighbor_dist_sq)
+            {
                 return None;
             }
 
             // 条件3 & 4: 平面フィッティング（実点を優先、なければボクセル中心）
-            let neighbor_points: Vec<Point3<f32>> = neighbors
-                .iter()
-                .map(|(c, _)| if c.is_point { c.point.0 } else { c.mean })
-                .collect();
+            let neighbor_points: [Point3<f32>; K] = std::array::from_fn(|i| {
+                let cell = neighbors[i].0;
+                if cell.is_point {
+                    cell.point.0
+                } else {
+                    cell.mean
+                }
+            });
 
             let plane_fit = fit_plane(&neighbor_points)?;
 
@@ -363,4 +388,63 @@ pub fn pickup_valid_source_points<'a>(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_top_k_matches_full_sort() {
+        const K: usize = 5;
+        let mut target_map = VoxelMap::default();
+
+        for iz in -2..=2 {
+            for iy in -2..=2 {
+                for ix in -2..=2 {
+                    let key = VoxelKey { ix, iy, iz };
+                    let point = Point3::new(ix as f32 + 0.5, iy as f32 + 0.5, iz as f32 + 0.5);
+                    target_map.insert(key, VoxelCell::from_key(&key, 1.0, point, 0));
+                }
+            }
+        }
+
+        // ボクセル中心に対して非対称な位置にし、距離の同値を避ける。
+        let query = Point3::new(0.137, 0.223, 0.071);
+        let actual = find_k_nearest_target_voxels::<K>(&query, &target_map, 1.0, 2, 100.0)
+            .expect("at least K neighbors");
+
+        let mut expected: Vec<_> = target_map
+            .values()
+            .map(|cell| {
+                let diff = query.coords - cell.mean.coords;
+                (cell, diff.dot(&diff))
+            })
+            .collect();
+        expected.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
+
+        for (actual, expected) in actual.iter().zip(expected.iter().take(K)) {
+            assert_eq!(actual.0.voxel_key, expected.0.voxel_key);
+            assert_eq!(actual.1, expected.1);
+        }
+    }
+
+    #[test]
+    fn fixed_top_k_rejects_too_few_neighbors() {
+        let mut target_map = VoxelMap::default();
+        let key = VoxelKey {
+            ix: 0,
+            iy: 0,
+            iz: 0,
+        };
+        target_map.insert(
+            key,
+            VoxelCell::from_key(&key, 1.0, Point3::new(0.5, 0.5, 0.5), 0),
+        );
+
+        assert!(
+            find_k_nearest_target_voxels::<5>(&Point3::origin(), &target_map, 1.0, 2, 100.0,)
+                .is_none()
+        );
+    }
 }

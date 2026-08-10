@@ -230,12 +230,11 @@ fn main() -> Result<()> {
                 // - source はローカル座標、target (local_voxel_map) はワールド座標
                 // - 現在の (R,t) 推定値で source をワールド変換してから近傍探索
                 let pickup_start = std::time::Instant::now();
-                let correspondences = pickup_valid_source_points(
+                let correspondences = pickup_valid_source_points::<LOCAL_KNN_K>(
                     &source_voxel_map,
                     &slam_map.local_voxel_map.voxel_map,
                     slam_map.local_voxel_map.config.index_voxel_size,
                     SEARCH_RANGE,
-                    LOCAL_KNN_K,
                     MAX_DIST_FACTOR,
                     LOCAL_PLANE_POINT_DISTANCE_THRESHOLD_M,
                     LOCAL_SOURCE_PLANE_SCORE_THRESHOLD,
@@ -374,12 +373,11 @@ fn main() -> Result<()> {
             if slam_map.local_voxel_map.voxel_map.is_empty() {
                 downsampled_source_points_for_global.clone()
             } else {
-                let valid = pickup_valid_source_points(
+                let valid = pickup_valid_source_points::<GLOBAL_KNN_K>(
                     &source_voxel_map_for_global,
                     &slam_map.local_voxel_map.voxel_map,
                     slam_map.local_voxel_map.config.index_voxel_size,
                     SEARCH_RANGE,
-                    GLOBAL_KNN_K,
                     MAX_DIST_FACTOR,
                     GLOBAL_PLANE_POINT_DISTANCE_THRESHOLD_M,
                     GLOBAL_SOURCE_PLANE_SCORE_THRESHOLD,
