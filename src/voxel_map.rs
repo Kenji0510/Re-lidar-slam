@@ -4,6 +4,8 @@ use nalgebra::{Matrix3, Matrix4, Point3, Vector3};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use crate::find_nearest_points::fit_plane;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct VoxelKey {
     pub ix: i32,
@@ -26,6 +28,49 @@ pub struct LocalMapConfig {
     pub max_frames: usize,
     /// 距離ベースの追い出し上限 [m]。
     pub max_distance: f32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SurfaceStatus {
+    #[default]
+    Unknown,
+    Planar,
+    NonPlanar,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SurfacePlane {
+    pub normal: Vector3<f32>,
+    pub d: f32,
+    pub rmse_m: f32,
+    pub neighbor_count: usize,
+    pub inlier_count: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SurfaceFilterConfig {
+    /// 2 の場合、中心を含む 5x5x5 ボクセルを平面推定に使う。
+    pub neighbor_radius_voxels: i32,
+    pub min_neighbors: usize,
+    pub min_ransac_inliers: usize,
+    pub min_center_observed_frames: u64,
+    pub ransac_iterations: usize,
+    /// RANSAC 仮説平面からこの距離以内の点を PCA 入力にする。
+    pub ransac_inlier_distance_m: f32,
+    pub min_inlier_ratio: f32,
+    pub min_planarity: f32,
+    pub max_surface_variation: f32,
+    pub max_pca_rmse_m: f32,
+    /// RANSACインライアからPCAで求めた平面と、中心ボクセル代表点との最大距離。
+    pub max_center_distance_m: f32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SurfaceClassificationStats {
+    pub evaluated: usize,
+    pub planar: usize,
+    pub non_planar: usize,
+    pub unknown: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +100,10 @@ pub struct VoxelCell {
     /// 共分散行列（compute_covariances() 呼び出し後に有効）。
     pub covariance: Matrix3<f32>,
     pub covariance_valid: bool,
+
+    /// 観測データは保持したまま、平面マップへの出力可否だけを表す。
+    pub surface_status: SurfaceStatus,
+    pub surface_plane: Option<SurfacePlane>,
 }
 
 pub struct FrameEntry {
@@ -86,7 +135,11 @@ impl LOCALMap {
 
     // 同一フレーム内の点をボクセルごとに平均し、
     // ボクセルの逐次平均・共分散を更新する。
-    fn insert_points(&mut self, source_points: &[Point3<f32>], global_pose: &Matrix4<f64>) {
+    fn insert_points(
+        &mut self,
+        source_points: &[Point3<f32>],
+        global_pose: &Matrix4<f64>,
+    ) -> FrameEntry {
         let pose_f32 = global_pose.cast::<f32>();
         let r_mat: Matrix3<f32> = pose_f32.fixed_view::<3, 3>(0, 0).into();
         let t_vec: Vector3<f32> = pose_f32.fixed_view::<3, 1>(0, 3).into();
@@ -104,8 +157,7 @@ impl LOCALMap {
             })
             .collect();
 
-        let mut frame_voxels: FxHashMap<VoxelKey, (Vector3<f32>, usize)> =
-            FxHashMap::default();
+        let mut frame_voxels: FxHashMap<VoxelKey, (Vector3<f32>, usize)> = FxHashMap::default();
 
         for (key, point) in world_pts {
             frame_voxels
@@ -135,31 +187,33 @@ impl LOCALMap {
         // }
 
         let min_samples = self.config.min_points_per_voxel;
+        let dirty_keys = frame_voxels.keys().copied().collect();
 
         for (key, (sum, count)) in frame_voxels {
             let frame_mean = Point3::from(sum / count as f32);
 
             match self.voxel_map.entry(key) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert(VoxelCell::from_key(
-                        &key,
-                        voxel_size,
-                        frame_mean,
-                        frame_id,
-                    ));
+                    entry.insert(VoxelCell::from_key(&key, voxel_size, frame_mean, frame_id));
                 }
 
                 std::collections::hash_map::Entry::Occupied(mut entry) => {
-                    entry.get_mut().update_statistics(
-                        frame_mean,
-                        frame_id,
-                        min_samples,
-                    );
+                    let cell = entry.get_mut();
+                    cell.update_statistics(frame_mean, frame_id, min_samples);
+                    // 新しい観測が入ったセルは、遅延平面判定が再度完了するまで未確定。
+                    cell.surface_status = SurfaceStatus::Unknown;
+                    cell.surface_plane = None;
                 }
             }
         }
 
         self.next_frame_id += 1;
+
+        FrameEntry {
+            frame_id,
+            origin: Point3::from(t_vec),
+            dirty_keys,
+        }
     }
 
     /// ICP で位置合わせ済みの source 点群をローカルマップに追加する。
@@ -169,7 +223,7 @@ impl LOCALMap {
         source_points: &[Point3<f32>],
         global_pose: &Matrix4<f64>,
     ) {
-        self.insert_points(source_points, global_pose);
+        let _ = self.insert_points(source_points, global_pose);
 
         // 自己位置から max_distance 以上のボクセルを破棄
         let pose_f32 = global_pose.cast::<f32>();
@@ -182,8 +236,317 @@ impl LOCALMap {
     /// ICP で位置合わせ済みの source 点群をワールドマップに追加する。
     /// ローカルマップと異なり、距離によるボクセル削除は行わない。
     pub fn update_world_map(&mut self, source_points: &[Point3<f32>], global_pose: &Matrix4<f64>) {
-        self.insert_points(source_points, global_pose);
+        let frame_entry = self.insert_points(source_points, global_pose);
+        self.frame_index.push_back(frame_entry);
     }
+
+    /// 現在フレームから `delay_frames` 以上古い更新領域を、現在までの累積点で再判定する。
+    pub fn classify_delayed_surface_voxels(
+        &mut self,
+        delay_frames: u64,
+        filter_config: &SurfaceFilterConfig,
+    ) -> SurfaceClassificationStats {
+        let Some(current_frame_id) = self.next_frame_id.checked_sub(1) else {
+            return SurfaceClassificationStats::default();
+        };
+
+        let mut dirty_keys = FxHashSet::default();
+        while self
+            .frame_index
+            .front()
+            .is_some_and(|entry| current_frame_id.saturating_sub(entry.frame_id) >= delay_frames)
+        {
+            if let Some(entry) = self.frame_index.pop_front() {
+                dirty_keys.extend(entry.dirty_keys);
+            }
+        }
+
+        self.classify_surface_voxels_affected_by(&dirty_keys, filter_config)
+    }
+
+    /// 全ボクセルを現在の累積点で再判定する。終了時の最終確定用。
+    pub fn classify_all_surface_voxels(
+        &mut self,
+        filter_config: &SurfaceFilterConfig,
+    ) -> SurfaceClassificationStats {
+        let center_keys: Vec<VoxelKey> = self.voxel_map.keys().copied().collect();
+        self.classify_surface_voxels(&center_keys, filter_config)
+    }
+
+    fn classify_surface_voxels_affected_by(
+        &mut self,
+        dirty_keys: &FxHashSet<VoxelKey>,
+        filter_config: &SurfaceFilterConfig,
+    ) -> SurfaceClassificationStats {
+        if dirty_keys.is_empty() {
+            return SurfaceClassificationStats::default();
+        }
+
+        let radius = filter_config.neighbor_radius_voxels.max(0);
+        let mut center_keys = FxHashSet::default();
+
+        // dirty voxel は、周囲 radius 内の各中心ボクセルの平面推定に影響する。
+        for dirty_key in dirty_keys {
+            for dz in -radius..=radius {
+                for dy in -radius..=radius {
+                    for dx in -radius..=radius {
+                        let center_key = VoxelKey {
+                            ix: dirty_key.ix + dx,
+                            iy: dirty_key.iy + dy,
+                            iz: dirty_key.iz + dz,
+                        };
+                        if self.voxel_map.contains_key(&center_key) {
+                            center_keys.insert(center_key);
+                        }
+                    }
+                }
+            }
+        }
+
+        let center_keys: Vec<VoxelKey> = center_keys.into_iter().collect();
+        self.classify_surface_voxels(&center_keys, filter_config)
+    }
+
+    fn classify_surface_voxels(
+        &mut self,
+        center_keys: &[VoxelKey],
+        filter_config: &SurfaceFilterConfig,
+    ) -> SurfaceClassificationStats {
+        let evaluations: Vec<(VoxelKey, SurfaceEvaluation)> = {
+            let voxel_map = &self.voxel_map;
+            center_keys
+                .par_iter()
+                .filter_map(|key| {
+                    evaluate_surface_voxel(voxel_map, *key, filter_config)
+                        .map(|evaluation| (*key, evaluation))
+                })
+                .collect()
+        };
+
+        let mut stats = SurfaceClassificationStats::default();
+        for (key, evaluation) in evaluations {
+            let Some(cell) = self.voxel_map.get_mut(&key) else {
+                continue;
+            };
+
+            cell.surface_status = evaluation.status;
+            cell.surface_plane = evaluation.plane;
+            stats.evaluated += 1;
+            match evaluation.status {
+                SurfaceStatus::Unknown => stats.unknown += 1,
+                SurfaceStatus::Planar => stats.planar += 1,
+                SurfaceStatus::NonPlanar => stats.non_planar += 1,
+            }
+        }
+
+        stats
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SurfaceEvaluation {
+    status: SurfaceStatus,
+    plane: Option<SurfacePlane>,
+}
+
+fn evaluate_surface_voxel(
+    voxel_map: &VoxelMap,
+    center_key: VoxelKey,
+    config: &SurfaceFilterConfig,
+) -> Option<SurfaceEvaluation> {
+    let center_cell = voxel_map.get(&center_key)?;
+    if center_cell.observed_frames < config.min_center_observed_frames {
+        return Some(SurfaceEvaluation {
+            status: SurfaceStatus::Unknown,
+            plane: None,
+        });
+    }
+
+    let radius = config.neighbor_radius_voxels.max(0);
+    let mut neighbor_points = Vec::new();
+    for dz in -radius..=radius {
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
+                let key = VoxelKey {
+                    ix: center_key.ix + dx,
+                    iy: center_key.iy + dy,
+                    iz: center_key.iz + dz,
+                };
+                if let Some(cell) = voxel_map.get(&key) {
+                    neighbor_points.push(cell.mean);
+                }
+            }
+        }
+    }
+
+    if neighbor_points.len() < config.min_neighbors {
+        return Some(SurfaceEvaluation {
+            status: SurfaceStatus::Unknown,
+            plane: None,
+        });
+    }
+
+    let Some(inliers) = ransac_plane_inliers(
+        &neighbor_points,
+        center_key,
+        config.ransac_iterations,
+        config.ransac_inlier_distance_m,
+    ) else {
+        return Some(SurfaceEvaluation {
+            status: SurfaceStatus::NonPlanar,
+            plane: None,
+        });
+    };
+
+    let inlier_ratio = inliers.len() as f32 / neighbor_points.len() as f32;
+    if inliers.len() < config.min_ransac_inliers || inlier_ratio < config.min_inlier_ratio {
+        return Some(SurfaceEvaluation {
+            status: SurfaceStatus::NonPlanar,
+            plane: None,
+        });
+    }
+
+    // RANSAC で外れ値を除去した後の PCA は、この1回だけ実施する。
+    let Some(fitted_plane) = fit_plane(&inliers) else {
+        return Some(SurfaceEvaluation {
+            status: SurfaceStatus::NonPlanar,
+            plane: None,
+        });
+    };
+
+    let rmse_m = (inliers
+        .iter()
+        .map(|point| (fitted_plane.normal.dot(&point.coords) + fitted_plane.d).powi(2))
+        .sum::<f32>()
+        / inliers.len() as f32)
+        .sqrt();
+    let center_distance =
+        (fitted_plane.normal.dot(&center_cell.mean.coords) + fitted_plane.d).abs();
+
+    let is_planar = fitted_plane.planarity() >= config.min_planarity
+        && fitted_plane.surface_variation() <= config.max_surface_variation
+        && rmse_m <= config.max_pca_rmse_m
+        && center_distance <= config.max_center_distance_m;
+
+    let plane = is_planar.then_some(SurfacePlane {
+        normal: fitted_plane.normal,
+        d: fitted_plane.d,
+        rmse_m,
+        neighbor_count: neighbor_points.len(),
+        inlier_count: inliers.len(),
+    });
+
+    Some(SurfaceEvaluation {
+        status: if is_planar {
+            SurfaceStatus::Planar
+        } else {
+            SurfaceStatus::NonPlanar
+        },
+        plane,
+    })
+}
+
+/// 3点仮説を決定論的にサンプリングし、最多インライアの集合を返す。
+/// 同数の場合はインライアの二乗残差和が小さい仮説を優先する。
+fn ransac_plane_inliers(
+    points: &[Point3<f32>],
+    center_key: VoxelKey,
+    iterations: usize,
+    inlier_distance_m: f32,
+) -> Option<Vec<Point3<f32>>> {
+    if points.len() < 3
+        || iterations == 0
+        || !inlier_distance_m.is_finite()
+        || inlier_distance_m <= 0.0
+    {
+        return None;
+    }
+
+    let threshold_sq = inlier_distance_m * inlier_distance_m;
+    let mut random_state = ransac_seed(center_key);
+    let mut best_indices = Vec::new();
+    let mut best_squared_error = f32::INFINITY;
+
+    for _ in 0..iterations {
+        let [i0, i1, i2] = sample_three_distinct_indices(&mut random_state, points.len());
+        let p0 = points[i0];
+        let v1 = points[i1].coords - p0.coords;
+        let v2 = points[i2].coords - p0.coords;
+        let normal = v1.cross(&v2);
+        let normal_norm = normal.norm();
+        if !normal_norm.is_finite() || normal_norm <= 1e-6 {
+            continue;
+        }
+
+        let normal = normal / normal_norm;
+        let d = -normal.dot(&p0.coords);
+        let mut indices = Vec::new();
+        let mut squared_error = 0.0;
+
+        for (index, point) in points.iter().enumerate() {
+            let distance = normal.dot(&point.coords) + d;
+            let distance_sq = distance * distance;
+            if distance_sq <= threshold_sq {
+                indices.push(index);
+                squared_error += distance_sq;
+            }
+        }
+
+        if indices.len() > best_indices.len()
+            || (indices.len() == best_indices.len() && squared_error < best_squared_error)
+        {
+            best_indices = indices;
+            best_squared_error = squared_error;
+        }
+    }
+
+    (!best_indices.is_empty()).then(|| {
+        best_indices
+            .into_iter()
+            .map(|index| points[index])
+            .collect()
+    })
+}
+
+fn sample_three_distinct_indices(random_state: &mut u64, len: usize) -> [usize; 3] {
+    let first = next_random_index(random_state, len);
+
+    let mut second = next_random_index(random_state, len - 1);
+    if second >= first {
+        second += 1;
+    }
+
+    let mut third = next_random_index(random_state, len - 2);
+    let lower_excluded = first.min(second);
+    let upper_excluded = first.max(second);
+    if third >= lower_excluded {
+        third += 1;
+    }
+    if third >= upper_excluded {
+        third += 1;
+    }
+
+    [first, second, third]
+}
+
+fn next_random_index(random_state: &mut u64, len: usize) -> usize {
+    // SplitMix64: 外部乱数依存なしで、同じ VoxelKey から常に同じ仮説列を生成する。
+    *random_state = random_state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut value = *random_state;
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^= value >> 31;
+    (value % len as u64) as usize
+}
+
+fn ransac_seed(key: VoxelKey) -> u64 {
+    let x = key.ix as u32 as u64;
+    let y = key.iy as u32 as u64;
+    let z = key.iz as u32 as u64;
+    x.wrapping_mul(0x9e37_79b1_85eb_ca87)
+        ^ y.wrapping_mul(0xc2b2_ae3d_27d4_eb4f)
+        ^ z.wrapping_mul(0x1656_67b1_9e37_79f9)
+        ^ 0xa076_1d64_78bd_642f
 }
 
 #[inline]
@@ -215,15 +578,14 @@ impl VoxelCell {
 
             covariance: Matrix3::zeros(),
             covariance_valid: false,
+
+            surface_status: SurfaceStatus::Unknown,
+            surface_plane: None,
         }
     }
 
     pub fn from_key(key: &VoxelKey, voxel_size: f32, point: Point3<f32>, frame_id: u64) -> Self {
-        let center = Point3::new(
-            (key.ix as f32 + 0.5) * voxel_size,
-            (key.iy as f32 + 0.5) * voxel_size,
-            (key.iz as f32 + 0.5) * voxel_size,
-        );
+        let _ = voxel_size;
         Self {
             point: (point, frame_id),
             is_point: true,
@@ -238,6 +600,9 @@ impl VoxelCell {
 
             covariance: Matrix3::zeros(),
             covariance_valid: false,
+
+            surface_status: SurfaceStatus::Unknown,
+            surface_plane: None,
         }
     }
 
@@ -377,5 +742,208 @@ pub fn compute_covariances(voxel_map: &mut VoxelMap, min_points: usize, neighbor
         } else {
             cell.covariance_valid = false;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn map_config() -> LocalMapConfig {
+        LocalMapConfig {
+            index_voxel_size: 0.05,
+            max_points_per_voxel: 20,
+            min_points_per_voxel: 2,
+            min_observed_frames_per_voxel: 2,
+            max_frames: 50,
+            max_distance: 150.0,
+        }
+    }
+
+    fn surface_filter_config() -> SurfaceFilterConfig {
+        SurfaceFilterConfig {
+            neighbor_radius_voxels: 2,
+            min_neighbors: 10,
+            min_ransac_inliers: 8,
+            min_center_observed_frames: 2,
+            ransac_iterations: 64,
+            ransac_inlier_distance_m: 0.025,
+            min_inlier_ratio: 0.50,
+            min_planarity: 0.20,
+            max_surface_variation: 0.04,
+            max_pca_rmse_m: 0.025,
+            max_center_distance_m: 0.025,
+        }
+    }
+
+    fn insert_test_cell(map: &mut LOCALMap, key: VoxelKey, point: Point3<f32>) {
+        let mut cell = VoxelCell::from_key(&key, map.config.index_voxel_size, point, 1);
+        cell.sample_count = 2;
+        cell.observed_frames = 2;
+        map.voxel_map.insert(key, cell);
+    }
+
+    fn insert_xy_plane(map: &mut LOCALMap, center_is_outlier: bool) {
+        for iy in -2..=2 {
+            for ix in -2..=2 {
+                let key = VoxelKey { ix, iy, iz: 0 };
+                let is_center = ix == 0 && iy == 0;
+                let is_other_outlier = ix == 2 && iy == 2;
+                let z = if (center_is_outlier && is_center)
+                    || (!center_is_outlier && is_other_outlier)
+                {
+                    0.15
+                } else {
+                    0.0
+                };
+                insert_test_cell(map, key, Point3::new(ix as f32 * 0.05, iy as f32 * 0.05, z));
+            }
+        }
+    }
+
+    #[test]
+    fn ransac_then_single_pca_keeps_center_on_dominant_plane() {
+        let mut map = LOCALMap::new(map_config());
+        insert_xy_plane(&mut map, false);
+
+        map.classify_all_surface_voxels(&surface_filter_config());
+
+        let center = map
+            .voxel_map
+            .get(&VoxelKey {
+                ix: 0,
+                iy: 0,
+                iz: 0,
+            })
+            .unwrap();
+        assert_eq!(center.surface_status, SurfaceStatus::Planar);
+        assert_eq!(center.surface_plane.unwrap().inlier_count, 24);
+    }
+
+    #[test]
+    fn ransac_then_single_pca_rejects_center_away_from_dominant_plane() {
+        let mut map = LOCALMap::new(map_config());
+        insert_xy_plane(&mut map, true);
+
+        map.classify_all_surface_voxels(&surface_filter_config());
+
+        let center = map
+            .voxel_map
+            .get(&VoxelKey {
+                ix: 0,
+                iy: 0,
+                iz: 0,
+            })
+            .unwrap();
+        assert_eq!(center.surface_status, SurfaceStatus::NonPlanar);
+        assert!(center.surface_plane.is_none());
+    }
+
+    #[test]
+    fn ransac_removes_parallel_noise_before_pca() {
+        let mut points = Vec::new();
+        for iy in -2..=2 {
+            for ix in -2..=2 {
+                points.push(Point3::new(ix as f32 * 0.05, iy as f32 * 0.05, 0.0));
+            }
+        }
+        for ix in -2..=2 {
+            points.push(Point3::new(ix as f32 * 0.05, 0.0, 0.06));
+            points.push(Point3::new(ix as f32 * 0.05, 0.0, -0.06));
+        }
+
+        let center_key = VoxelKey {
+            ix: 0,
+            iy: 0,
+            iz: 0,
+        };
+        let first = ransac_plane_inliers(&points, center_key, 64, 0.025).unwrap();
+        let second = ransac_plane_inliers(&points, center_key, 64, 0.025).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 25);
+        assert!(first.iter().all(|point| point.z == 0.0));
+    }
+
+    #[test]
+    fn surface_filter_accepts_eight_planar_inliers_in_sparse_neighborhood() {
+        let mut map = LOCALMap::new(map_config());
+        for iy in -1..=1 {
+            for ix in -1..=1 {
+                if ix == 1 && iy == 1 {
+                    continue;
+                }
+                let key = VoxelKey { ix, iy, iz: 0 };
+                insert_test_cell(
+                    &mut map,
+                    key,
+                    Point3::new(ix as f32 * 0.05, iy as f32 * 0.05, 0.0),
+                );
+            }
+        }
+        insert_test_cell(
+            &mut map,
+            VoxelKey {
+                ix: 2,
+                iy: 2,
+                iz: 1,
+            },
+            Point3::new(0.10, 0.10, 0.08),
+        );
+        insert_test_cell(
+            &mut map,
+            VoxelKey {
+                ix: -2,
+                iy: -2,
+                iz: -1,
+            },
+            Point3::new(-0.10, -0.10, -0.08),
+        );
+
+        map.classify_all_surface_voxels(&surface_filter_config());
+
+        let center = map
+            .voxel_map
+            .get(&VoxelKey {
+                ix: 0,
+                iy: 0,
+                iz: 0,
+            })
+            .unwrap();
+        assert_eq!(center.surface_status, SurfaceStatus::Planar);
+        assert!(center.surface_plane.unwrap().inlier_count >= 8);
+    }
+
+    #[test]
+    fn delayed_classification_releases_frame_after_requested_age() {
+        let mut map = LOCALMap::new(map_config());
+        let pose = Matrix4::<f64>::identity();
+        let points = [Point3::new(0.01, 0.01, 0.01)];
+        let filter_config = surface_filter_config();
+
+        map.update_world_map(&points, &pose);
+        assert_eq!(
+            map.classify_delayed_surface_voxels(2, &filter_config)
+                .evaluated,
+            0
+        );
+        assert_eq!(map.frame_index.len(), 1);
+
+        map.update_world_map(&points, &pose);
+        assert_eq!(
+            map.classify_delayed_surface_voxels(2, &filter_config)
+                .evaluated,
+            0
+        );
+        assert_eq!(map.frame_index.len(), 2);
+
+        map.update_world_map(&points, &pose);
+        assert_eq!(
+            map.classify_delayed_surface_voxels(2, &filter_config)
+                .evaluated,
+            1
+        );
+        assert_eq!(map.frame_index.len(), 2);
+        assert_eq!(map.frame_index.front().unwrap().frame_id, 1);
     }
 }

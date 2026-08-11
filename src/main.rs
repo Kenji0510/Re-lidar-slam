@@ -7,7 +7,7 @@ use re_lidar_slam::{
     icp::{apply_delta, build_point_to_plane_system, compute_rmse, solve_icp_delta},
     predict_pose_by_imu::{align_imu_timestamps, build_rotation_trajectory, predict_pose_by_imu},
     types::{CurrentFrameInfo, FrameLog, PointXYZ, SLAMMap},
-    voxel_map::{LOCALMap, LocalMapConfig, build_voxel_map},
+    voxel_map::{LOCALMap, LocalMapConfig, SurfaceFilterConfig, SurfaceStatus, build_voxel_map},
     voxelization::voxel_downsample_points,
 };
 use std::time::{Duration, Instant};
@@ -57,6 +57,20 @@ const GLOBAL_SOURCE_TO_PLANE_MAX_DISTANCE_M: f32 = 0.08;
 // Wall/ground edges tend to form line-like or mixed neighborhoods. Reject them
 // during global-map insertion, while retaining sparse Mid-70 observations.
 const GLOBAL_MIN_PLANARITY: f32 = 0.10;
+
+// Global map の累積点から局所平面を確定するための遅延・5x5x5 RANSAC/PCA 設定。
+const SURFACE_CLASSIFICATION_DELAY_FRAMES: u64 = 30;
+const SURFACE_NEIGHBOR_RADIUS_VOXELS: i32 = 2;
+const SURFACE_MIN_NEIGHBORS: usize = 10;
+const SURFACE_MIN_RANSAC_INLIERS: usize = 8;
+const SURFACE_MIN_CENTER_OBSERVED_FRAMES: u64 = 2;
+const SURFACE_RANSAC_ITERATIONS: usize = 64;
+const SURFACE_RANSAC_INLIER_DISTANCE_M: f32 = 0.025;
+const SURFACE_MIN_INLIER_RATIO: f32 = 0.50;
+const SURFACE_MIN_PLANARITY: f32 = 0.20;
+const SURFACE_MAX_VARIATION: f32 = 0.04;
+const SURFACE_MAX_PCA_RMSE_M: f32 = 0.025;
+const SURFACE_MAX_CENTER_DISTANCE_M: f32 = 0.025;
 
 const ICP_ITERATIONS: usize = 8;
 const ICP_RMSE_THRESHOLD: f32 = 0.10; // Absolute point-to-plane RMSE convergence threshold [m]
@@ -114,6 +128,19 @@ fn main() -> Result<()> {
     let mut slam_map = SLAMMap {
         global_voxel_map: LOCALMap::new(global_map_config),
         local_voxel_map: LOCALMap::new(local_map_config),
+    };
+    let surface_filter_config = SurfaceFilterConfig {
+        neighbor_radius_voxels: SURFACE_NEIGHBOR_RADIUS_VOXELS,
+        min_neighbors: SURFACE_MIN_NEIGHBORS,
+        min_ransac_inliers: SURFACE_MIN_RANSAC_INLIERS,
+        min_center_observed_frames: SURFACE_MIN_CENTER_OBSERVED_FRAMES,
+        ransac_iterations: SURFACE_RANSAC_ITERATIONS,
+        ransac_inlier_distance_m: SURFACE_RANSAC_INLIER_DISTANCE_M,
+        min_inlier_ratio: SURFACE_MIN_INLIER_RATIO,
+        min_planarity: SURFACE_MIN_PLANARITY,
+        max_surface_variation: SURFACE_MAX_VARIATION,
+        max_pca_rmse_m: SURFACE_MAX_PCA_RMSE_M,
+        max_center_distance_m: SURFACE_MAX_CENTER_DISTANCE_M,
     };
     // <--- Initialize SLAM map --->
 
@@ -410,6 +437,24 @@ fn main() -> Result<()> {
             &current_frame_info.current_global_pose,
         );
         let global_map_update_time = global_map_update_start.elapsed();
+
+        let delayed_surface_start = Instant::now();
+        let delayed_surface_stats = slam_map.global_voxel_map.classify_delayed_surface_voxels(
+            SURFACE_CLASSIFICATION_DELAY_FRAMES,
+            &surface_filter_config,
+        );
+        let delayed_surface_time = delayed_surface_start.elapsed();
+        if delayed_surface_stats.evaluated > 0 {
+            log::debug!(
+                "Frame {i}: delayed surface classification evaluated={}, planar={}, \
+                 non_planar={}, unknown={} in {:.2?}",
+                delayed_surface_stats.evaluated,
+                delayed_surface_stats.planar,
+                delayed_surface_stats.non_planar,
+                delayed_surface_stats.unknown,
+                delayed_surface_time,
+            );
+        }
         // --- Filter valid source points, then update the WorldMap ---
 
         // --- Update the LocalMap with the new frame's points ---
@@ -430,7 +475,8 @@ fn main() -> Result<()> {
              imu_predict={:.3} ms, rotation_trajectory={:.3} ms, deskew={:.3} ms, \
              downsample={:.3} ms, build_source_maps={:.3} ms, icp={:.3} ms, \
              pose_update={:.3} ms, global_filter={:.3} ms, global_map_update={:.3} ms, \
-             local_map_update={:.3} ms, total={:.3} ms (with_file_io={:.3} ms)",
+             delayed_surface={:.3} ms, local_map_update={:.3} ms, total={:.3} ms \
+             (with_file_io={:.3} ms)",
             duration_ms(load_pcd_time),
             duration_ms(timestamp_time),
             duration_ms(predict_pose_time),
@@ -442,13 +488,14 @@ fn main() -> Result<()> {
             duration_ms(pose_update_time),
             duration_ms(global_filter_time),
             duration_ms(global_map_update_time),
+            duration_ms(delayed_surface_time),
             duration_ms(local_map_update_time),
             duration_ms(frame_processing_time),
             duration_ms(frame_total_with_file_io),
         );
     }
 
-    // --- Save the final global voxel map to a PCD file ---
+    // --- Save the global voxel maps before and after final plane classification ---
     let min_samples = slam_map.global_voxel_map.config.min_points_per_voxel as u64;
 
     let min_frames = slam_map
@@ -456,7 +503,8 @@ fn main() -> Result<()> {
         .config
         .min_observed_frames_per_voxel as u64;
 
-    let world_map_points: Vec<Point3<f32>> = slam_map
+    // 平面処理前: 従来条件を満たす全観測セルを別ファイルへ保存する。
+    let world_map_points_before_plane_filter: Vec<Point3<f32>> = slam_map
         .global_voxel_map
         .voxel_map
         .values()
@@ -464,9 +512,63 @@ fn main() -> Result<()> {
         .map(|cell| Point3::new(cell.mean.x, cell.mean.y, cell.mean.z))
         .collect();
 
-    let downsampled_world_map_points =
-        voxel_downsample_points(&world_map_points, GLOBAL_MAP_VOXEL_SIZE);
-    let downsampled_world_map_points_xyz: Vec<PointXYZ> = downsampled_world_map_points
+    let downsampled_world_map_points_before_plane_filter =
+        voxel_downsample_points(&world_map_points_before_plane_filter, GLOBAL_MAP_VOXEL_SIZE);
+    let world_map_points_before_plane_filter_xyz: Vec<PointXYZ> =
+        downsampled_world_map_points_before_plane_filter
+            .iter()
+            .map(|point| PointXYZ {
+                x: point.x,
+                y: point.y,
+                z: point.z,
+            })
+            .collect();
+
+    std::fs::create_dir_all(SAVE_DIR)?;
+    let world_map_before_plane_filter_path = format!(
+        "{}/voxel-{}_world_map_before_plane_filter.pcd",
+        SAVE_DIR, GLOBAL_MAP_VOXEL_SIZE
+    );
+    save_pcd_xyz(
+        &world_map_points_before_plane_filter_xyz,
+        &world_map_before_plane_filter_path,
+    )?;
+    log::info!(
+        "Saved world map before plane filter: {} → {} points → {}",
+        world_map_points_before_plane_filter.len(),
+        world_map_points_before_plane_filter_xyz.len(),
+        world_map_before_plane_filter_path,
+    );
+
+    // 終端処理: 遅延キューの状態に依存せず、現在の全累積点で全セルを再判定する。
+    let final_surface_start = Instant::now();
+    let final_surface_stats = slam_map
+        .global_voxel_map
+        .classify_all_surface_voxels(&surface_filter_config);
+    log::info!(
+        "Final surface classification: evaluated={}, planar={}, non_planar={}, unknown={} in {:.2?}",
+        final_surface_stats.evaluated,
+        final_surface_stats.planar,
+        final_surface_stats.non_planar,
+        final_surface_stats.unknown,
+        final_surface_start.elapsed(),
+    );
+
+    let planar_world_map_points: Vec<Point3<f32>> = slam_map
+        .global_voxel_map
+        .voxel_map
+        .values()
+        .filter(|cell| {
+            cell.sample_count >= min_samples
+                && cell.observed_frames >= min_frames
+                && cell.surface_status == SurfaceStatus::Planar
+        })
+        .map(|cell| Point3::new(cell.mean.x, cell.mean.y, cell.mean.z))
+        .collect();
+
+    let downsampled_planar_world_map_points =
+        voxel_downsample_points(&planar_world_map_points, GLOBAL_MAP_VOXEL_SIZE);
+    let planar_world_map_points_xyz: Vec<PointXYZ> = downsampled_planar_world_map_points
         .iter()
         .map(|point| PointXYZ {
             x: point.x,
@@ -475,16 +577,17 @@ fn main() -> Result<()> {
         })
         .collect();
 
-    let world_map_path = format!("{}/voxel-{}_world_map.pcd", SAVE_DIR, GLOBAL_MAP_VOXEL_SIZE);
-    std::fs::create_dir_all(SAVE_DIR)?;
-    save_pcd_xyz(&downsampled_world_map_points_xyz, &world_map_path)?;
+    // 既存ファイル名は平面処理後の最終マップとして維持する。
+    let planar_world_map_path =
+        format!("{}/voxel-{}_world_map.pcd", SAVE_DIR, GLOBAL_MAP_VOXEL_SIZE);
+    save_pcd_xyz(&planar_world_map_points_xyz, &planar_world_map_path)?;
     log::info!(
-        "Saved downsampled world map: {} → {} points → {}",
-        world_map_points.len(),
-        downsampled_world_map_points_xyz.len(),
-        world_map_path
+        "Saved planar world map: {} → {} points → {}",
+        planar_world_map_points.len(),
+        planar_world_map_points_xyz.len(),
+        planar_world_map_path,
     );
-    // --- Save the final global voxel map to a PCD file ---
+    // --- Save the global voxel maps before and after final plane classification ---
 
     // --- Save per-frame ICP logs to JSON ---
     let frame_logs_path = format!("{}/frame_logs.json", SAVE_DIR);
