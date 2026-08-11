@@ -6,10 +6,11 @@ use re_lidar_slam::{
     find_nearest_points::pickup_valid_source_points,
     icp::{apply_delta, build_point_to_plane_system, compute_rmse, solve_icp_delta},
     predict_pose_by_imu::{align_imu_timestamps, build_rotation_trajectory, predict_pose_by_imu},
-    types::{CurrentFrameInfo, FrameLog, PointXYZ, ProcessTimes, SLAMMap},
+    types::{CurrentFrameInfo, FrameLog, PointXYZ, SLAMMap},
     voxel_map::{LOCALMap, LocalMapConfig, build_voxel_map},
     voxelization::voxel_downsample_points,
 };
+use std::time::{Duration, Instant};
 
 const LOAD_DIR: &str = "data/input/08082026/08012026-airy96-mid70-06/mid-70"; // /home/kenji/mnt/nfs/share/airy96/06212026/park05
 const SAVE_DIR: &str = "data/output/debug/08082026";
@@ -66,13 +67,6 @@ const MAX_DIST_FOR_VOXEL_MAP: f32 = 150.0;
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
 
-    let mut process_times = ProcessTimes {
-        total: 0.0,
-        find_nearest_points: 0.0,
-        icp: 0.0,
-        update_map: 0.0,
-    };
-
     // <--- Loading each data --->
     let pcd_dir = format!("{}/pcd", LOAD_DIR);
     let pcd_files = load_pcd_files(&pcd_dir)?;
@@ -126,14 +120,19 @@ fn main() -> Result<()> {
     let mut prev_frame_start_time: f64 = 0.0;
     let mut frame_logs: Vec<FrameLog> = Vec::new();
 
-    let start_time = std::time::Instant::now();
-
     //
     for (i, pcd_path) in pcd_files.iter().enumerate() {
+        let frame_start = Instant::now();
         log::info!("Processing frame {}: {}", i, pcd_path.to_string_lossy());
 
+        let load_pcd_start = Instant::now();
         let source_pcd = load_pcd_xyzit(&pcd_path.to_string_lossy())?;
+        let load_pcd_time = load_pcd_start.elapsed();
+        // Main per-frame processing excludes file I/O. The full elapsed time is
+        // measured separately from frame_start and reported alongside it.
+        let frame_processing_start = Instant::now();
 
+        let timestamp_start = Instant::now();
         let current_frame_start_time = source_pcd
             .iter()
             .map(|p| p.timestamp)
@@ -142,12 +141,14 @@ fn main() -> Result<()> {
             .iter()
             .map(|p| p.timestamp)
             .fold(f64::NEG_INFINITY, f64::max);
+        let timestamp_time = timestamp_start.elapsed();
 
         if i == 0 {
             prev_frame_start_time = current_frame_start_time;
         }
 
         // <--- Predict pose by IMU --->
+        let predict_pose_start = Instant::now();
         let pose_prediction = predict_pose_by_imu(
             &imu_data,
             &imu_to_mid70,
@@ -156,18 +157,22 @@ fn main() -> Result<()> {
             prev_frame_start_time,
             current_frame_start_time,
         );
+        let predict_pose_time = predict_pose_start.elapsed();
         // <--- Predict pose by IMU --->
 
         // <--- Build rotation trajectory --->
+        let rotation_trajectory_start = Instant::now();
         let rotation_traj = build_rotation_trajectory(
             &imu_data,
             current_frame_start_time,
             current_frame_end_time,
             &imu_to_mid70,
         );
+        let rotation_trajectory_time = rotation_trajectory_start.elapsed();
         // <--- Build rotation trajectory --->
 
         // --- Deskew source pcd ---
+        let deskew_start = Instant::now();
         let deskewed_points = deskew_points(
             &source_pcd,
             &rotation_traj,
@@ -176,10 +181,11 @@ fn main() -> Result<()> {
             MIN_DIST,
             MAX_DIST,
         );
+        let deskew_time = deskew_start.elapsed();
         // --- Deskew source pcd ---
 
         // --- Downsample deskewed points ---
-        let voxel_start = std::time::Instant::now();
+        let voxel_start = Instant::now();
         let downsampled_source_points_for_local =
             voxel_downsample_points(&deskewed_points, DOWNSAMPLE_VOXEL_SIZE);
         let downsampled_source_points_for_global =
@@ -194,7 +200,7 @@ fn main() -> Result<()> {
         // --- Downsample deskewed points ---
 
         // --- Build voxel map for source points ---
-        let build_map_start = std::time::Instant::now();
+        let build_map_start = Instant::now();
         let source_voxel_map = build_voxel_map(
             &downsampled_source_points_for_local,
             DOWNSAMPLE_VOXEL_SIZE,
@@ -220,7 +226,7 @@ fn main() -> Result<()> {
         let mut prev_rmse = f32::INFINITY;
         let mut icp_ok = false; // ICP が有効な解を得られたか
 
-        let loop_start = std::time::Instant::now();
+        let loop_start = Instant::now();
 
         if slam_map.local_voxel_map.voxel_map.is_empty() {
             log::debug!("Frame {i}: local map empty, skipping ICP");
@@ -229,7 +235,7 @@ fn main() -> Result<()> {
                 // 対応点をピックアップ
                 // - source はローカル座標、target (local_voxel_map) はワールド座標
                 // - 現在の (R,t) 推定値で source をワールド変換してから近傍探索
-                let pickup_start = std::time::Instant::now();
+                let pickup_start = Instant::now();
                 let correspondences = pickup_valid_source_points::<LOCAL_KNN_K>(
                     &source_voxel_map,
                     &slam_map.local_voxel_map.voxel_map,
@@ -251,7 +257,7 @@ fn main() -> Result<()> {
                 );
 
                 // 線形システム構築
-                let system_start = std::time::Instant::now();
+                let system_start = Instant::now();
                 let system = build_point_to_plane_system(&correspondences, &r_mat, &t_vec);
 
                 // 解く → pose 更新
@@ -315,6 +321,7 @@ fn main() -> Result<()> {
         // --- ICP (Point to Plane) ---
 
         // --- Update current frame info ---
+        let pose_update_start = Instant::now();
         let prev_pos = current_frame_info
             .current_global_pose
             .fixed_view::<3, 1>(0, 3)
@@ -364,11 +371,13 @@ fn main() -> Result<()> {
             pose_z: new_pos.z,
         });
         // --- Record frame log ---
+        let pose_update_time = pose_update_start.elapsed();
 
         // --- Filter valid source points, then update the WorldMap ---
         // ローカルマップが空（初回フレーム）の場合はフィルタなしで全点追加。
         // それ以外は pickup_valid_source_points で平面に乗っている点だけ抽出し、
         // ICP 収束後の最終姿勢 (r_mat, t_vec) でワールドマップに追加する。
+        let global_filter_start = Instant::now();
         let global_source_points: Vec<Point3<f32>> =
             if slam_map.local_voxel_map.voxel_map.is_empty() {
                 downsampled_source_points_for_global.clone()
@@ -393,20 +402,50 @@ fn main() -> Result<()> {
                 );
                 valid.into_iter().map(|c| c.src_point).collect()
             };
+        let global_filter_time = global_filter_start.elapsed();
+
+        let global_map_update_start = Instant::now();
         slam_map.global_voxel_map.update_world_map(
             &global_source_points,
             &current_frame_info.current_global_pose,
         );
+        let global_map_update_time = global_map_update_start.elapsed();
         // --- Filter valid source points, then update the WorldMap ---
 
         // --- Update the LocalMap with the new frame's points ---
+        let local_map_update_start = Instant::now();
         slam_map.local_voxel_map.update_with_new_frame(
             &downsampled_source_points_for_local,
             &current_frame_info.current_global_pose,
         );
+        let local_map_update_time = local_map_update_start.elapsed();
         // --- Update the LocalMap with the new frame's points ---
 
         prev_frame_start_time = current_frame_start_time;
+
+        let frame_processing_time = frame_processing_start.elapsed();
+        let frame_total_with_file_io = frame_start.elapsed();
+        log::debug!(
+            "Frame {i} timings [ms]: load_pcd={:.3} ms, timestamps={:.3} ms, \
+             imu_predict={:.3} ms, rotation_trajectory={:.3} ms, deskew={:.3} ms, \
+             downsample={:.3} ms, build_source_maps={:.3} ms, icp={:.3} ms, \
+             pose_update={:.3} ms, global_filter={:.3} ms, global_map_update={:.3} ms, \
+             local_map_update={:.3} ms, total={:.3} ms (with_file_io={:.3} ms)",
+            duration_ms(load_pcd_time),
+            duration_ms(timestamp_time),
+            duration_ms(predict_pose_time),
+            duration_ms(rotation_trajectory_time),
+            duration_ms(deskew_time),
+            duration_ms(voxel_end),
+            duration_ms(build_map_end),
+            duration_ms(loop_end),
+            duration_ms(pose_update_time),
+            duration_ms(global_filter_time),
+            duration_ms(global_map_update_time),
+            duration_ms(local_map_update_time),
+            duration_ms(frame_processing_time),
+            duration_ms(frame_total_with_file_io),
+        );
     }
 
     // --- Save the final global voxel map to a PCD file ---
@@ -459,6 +498,11 @@ fn main() -> Result<()> {
     // --- Save per-frame ICP logs to JSON ---
 
     Ok(())
+}
+
+#[inline]
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1_000.0
 }
 
 /// Mid-70座標の点をAiry-96座標へ写す外部変換 `T_airy96_from_mid70`。
