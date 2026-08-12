@@ -7,7 +7,10 @@ use re_lidar_slam::{
     icp::{apply_delta, build_point_to_plane_system, compute_rmse, solve_icp_delta},
     predict_pose_by_imu::{align_imu_timestamps, build_rotation_trajectory, predict_pose_by_imu},
     types::{CurrentFrameInfo, FrameLog, PointXYZ, SLAMMap},
-    voxel_map::{LOCALMap, LocalMapConfig, SurfaceFilterConfig, SurfaceStatus, build_voxel_map},
+    voxel_map::{
+        LOCALMap, LocalMapConfig, SurfaceFilterConfig, SurfaceStatus,
+        WorldMapUpdateFilterConfig, build_voxel_map,
+    },
     voxelization::voxel_downsample_points,
 };
 use std::time::{Duration, Instant};
@@ -59,7 +62,8 @@ const GLOBAL_SOURCE_TO_PLANE_MAX_DISTANCE_M: f32 = 0.08;
 const GLOBAL_MIN_PLANARITY: f32 = 0.10;
 
 // Global map の累積点から局所平面を確定するための遅延・5x5x5 RANSAC/PCA 設定。
-const SURFACE_CLASSIFICATION_DELAY_FRAMES: u64 = 30;
+// 成熟平面を後続フレームの挿入ゲートに使うため、従来の30フレームより早く確定する。
+const SURFACE_CLASSIFICATION_DELAY_FRAMES: u64 = 5;
 const SURFACE_NEIGHBOR_RADIUS_VOXELS: i32 = 2;
 const SURFACE_MIN_NEIGHBORS: usize = 10;
 const SURFACE_MIN_RANSAC_INLIERS: usize = 8;
@@ -71,6 +75,14 @@ const SURFACE_MIN_PLANARITY: f32 = 0.20;
 const SURFACE_MAX_VARIATION: f32 = 0.04;
 const SURFACE_MAX_PCA_RMSE_M: f32 = 0.025;
 const SURFACE_MAX_CENTER_DISTANCE_M: f32 = 0.025;
+
+// 成熟した GlobalMap 平面に対する新規観測の更新ゲート。
+// 2 cm以内は同一面として平面へ射影し、2～10 cmは二重壁候補として保留する。
+const WORLD_UPDATE_PLANE_SEARCH_RADIUS_VOXELS: i32 = 2;
+const WORLD_UPDATE_MIN_MATURE_OBSERVED_FRAMES: u64 = 3;
+const WORLD_UPDATE_ACCEPT_DISTANCE_M: f32 = 0.020;
+const WORLD_UPDATE_PENDING_DISTANCE_M: f32 = 0.10;
+const WORLD_UPDATE_PENDING_MAX_AGE_FRAMES: u64 = 30;
 
 const ICP_ITERATIONS: usize = 8;
 const ICP_RMSE_THRESHOLD: f32 = 0.10; // Absolute point-to-plane RMSE convergence threshold [m]
@@ -141,6 +153,14 @@ fn main() -> Result<()> {
         max_surface_variation: SURFACE_MAX_VARIATION,
         max_pca_rmse_m: SURFACE_MAX_PCA_RMSE_M,
         max_center_distance_m: SURFACE_MAX_CENTER_DISTANCE_M,
+    };
+    let world_map_update_filter_config = WorldMapUpdateFilterConfig {
+        mature_plane_search_radius_voxels: WORLD_UPDATE_PLANE_SEARCH_RADIUS_VOXELS,
+        min_mature_observed_frames: WORLD_UPDATE_MIN_MATURE_OBSERVED_FRAMES,
+        accept_distance_m: WORLD_UPDATE_ACCEPT_DISTANCE_M,
+        pending_distance_m: WORLD_UPDATE_PENDING_DISTANCE_M,
+        project_accepted_points: true,
+        pending_max_age_frames: WORLD_UPDATE_PENDING_MAX_AGE_FRAMES,
     };
     // <--- Initialize SLAM map --->
 
@@ -432,11 +452,22 @@ fn main() -> Result<()> {
         let global_filter_time = global_filter_start.elapsed();
 
         let global_map_update_start = Instant::now();
-        slam_map.global_voxel_map.update_world_map(
+        let global_update_stats = slam_map.global_voxel_map.update_world_map_filtered(
             &global_source_points,
             &current_frame_info.current_global_pose,
+            &world_map_update_filter_config,
         );
         let global_map_update_time = global_map_update_start.elapsed();
+        log::debug!(
+            "Frame {i}: GlobalMap update input={}, provisional={}, projected={}, \
+             pending={}, pending_voxels={}, non_finite={}",
+            global_update_stats.input_points,
+            global_update_stats.inserted_provisional,
+            global_update_stats.projected_to_mature_plane,
+            global_update_stats.held_pending,
+            global_update_stats.pending_voxels,
+            global_update_stats.rejected_non_finite,
+        );
 
         let delayed_surface_start = Instant::now();
         let delayed_surface_stats = slam_map.global_voxel_map.classify_delayed_surface_voxels(

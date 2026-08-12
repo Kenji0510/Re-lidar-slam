@@ -73,6 +73,59 @@ pub struct SurfaceClassificationStats {
     pub unknown: usize,
 }
 
+/// 成熟した GlobalMap 平面を使って新規観測を更新するための設定。
+///
+/// `accept_distance_m` より近い点は既存面の観測として平面へ射影して統合する。
+/// それより遠く `pending_distance_m` 以内にある点は、近接する二重壁や
+/// 姿勢誤差の可能性があるため、即座に占有 voxel を作らず保留する。
+#[derive(Debug, Clone, Copy)]
+pub struct WorldMapUpdateFilterConfig {
+    pub mature_plane_search_radius_voxels: i32,
+    pub min_mature_observed_frames: u64,
+    pub accept_distance_m: f32,
+    pub pending_distance_m: f32,
+    pub project_accepted_points: bool,
+    pub pending_max_age_frames: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WorldMapUpdateStats {
+    pub input_points: usize,
+    /// 周囲に成熟平面がなく、未確定の新規構造として追加した点数。
+    pub inserted_provisional: usize,
+    /// 成熟平面と整合し、その平面へ射影して追加した点数。
+    pub projected_to_mature_plane: usize,
+    /// 成熟平面の近くにあるが整合しないため保留した点数。
+    pub held_pending: usize,
+    pub rejected_non_finite: usize,
+    /// この更新後に保持されている pending voxel 数。
+    pub pending_voxels: usize,
+}
+
+#[derive(Debug, Clone)]
+struct PendingVoxelCell {
+    mean: Point3<f32>,
+    sample_count: u64,
+    last_observed_frame_id: u64,
+}
+
+impl PendingVoxelCell {
+    fn new(point: Point3<f32>, frame_id: u64) -> Self {
+        Self {
+            mean: point,
+            sample_count: 1,
+            last_observed_frame_id: frame_id,
+        }
+    }
+
+    fn update(&mut self, point: Point3<f32>, frame_id: u64) {
+        self.sample_count += 1;
+        self.mean.coords += (point.coords - self.mean.coords) / self.sample_count as f32;
+
+        self.last_observed_frame_id = frame_id;
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VoxelCell {
     // このvoxel内に入った代表点。
@@ -112,6 +165,17 @@ pub struct FrameEntry {
     pub dirty_keys: FxHashSet<VoxelKey>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum WorldPointUpdateDecision {
+    InsertProvisional(Point3<f32>),
+    InsertOnMaturePlane {
+        original: Point3<f32>,
+        insertion: Point3<f32>,
+    },
+    HoldPending(Point3<f32>),
+    RejectNonFinite,
+}
+
 /// VoxelKey is generated internally from trusted point-cloud coordinates, so a
 /// fast deterministic hasher is preferable to HashMap's HashDoS-resistant one.
 pub type VoxelMap = FxHashMap<VoxelKey, VoxelCell>;
@@ -121,6 +185,7 @@ pub struct LOCALMap {
     pub frame_index: VecDeque<FrameEntry>,
     pub config: LocalMapConfig,
     pub next_frame_id: u64,
+    pending_voxel_map: FxHashMap<VoxelKey, PendingVoxelCell>,
 }
 
 impl LOCALMap {
@@ -130,6 +195,7 @@ impl LOCALMap {
             frame_index: VecDeque::new(),
             config,
             next_frame_id: 0,
+            pending_voxel_map: FxHashMap::default(),
         }
     }
 
@@ -140,26 +206,36 @@ impl LOCALMap {
         source_points: &[Point3<f32>],
         global_pose: &Matrix4<f64>,
     ) -> FrameEntry {
+        // 並列で全点をワールド座標変換してキーを計算
         let pose_f32 = global_pose.cast::<f32>();
         let r_mat: Matrix3<f32> = pose_f32.fixed_view::<3, 3>(0, 0).into();
         let t_vec: Vector3<f32> = pose_f32.fixed_view::<3, 1>(0, 3).into();
+        let world_points: Vec<Point3<f32>> = source_points
+            .par_iter()
+            .map(|p| Point3::from(r_mat * p.coords + t_vec))
+            .collect();
 
+        self.insert_world_points(&world_points, Point3::from(t_vec))
+    }
+
+    /// 既にワールド座標へ変換済みの点を挿入する。
+    /// GlobalMap の平面ゲートで射影した点を再変換せず挿入するために分離している。
+    fn insert_world_points(
+        &mut self,
+        world_points: &[Point3<f32>],
+        origin: Point3<f32>,
+    ) -> FrameEntry {
         let voxel_size = self.config.index_voxel_size;
         let frame_id = self.next_frame_id;
 
-        // 並列で全点をワールド座標変換してキーを計算
-        let world_pts: Vec<(VoxelKey, Point3<f32>)> = source_points
-            .par_iter()
-            .map(|p| {
-                let p_world = Point3::from(r_mat * p.coords + t_vec);
-                let key = voxel_key(&p_world, voxel_size);
-                (key, p_world)
-            })
-            .collect();
-
         let mut frame_voxels: FxHashMap<VoxelKey, (Vector3<f32>, usize)> = FxHashMap::default();
 
-        for (key, point) in world_pts {
+        for point in world_points {
+            if !point.coords.iter().all(|value| value.is_finite()) {
+                continue;
+            }
+
+            let key = voxel_key(point, voxel_size);
             frame_voxels
                 .entry(key)
                 .and_modify(|(sum, count)| {
@@ -211,7 +287,7 @@ impl LOCALMap {
 
         FrameEntry {
             frame_id,
-            origin: Point3::from(t_vec),
+            origin,
             dirty_keys,
         }
     }
@@ -238,6 +314,190 @@ impl LOCALMap {
     pub fn update_world_map(&mut self, source_points: &[Point3<f32>], global_pose: &Matrix4<f64>) {
         let frame_entry = self.insert_points(source_points, global_pose);
         self.frame_index.push_back(frame_entry);
+    }
+
+    /// 成熟した GlobalMap 平面との整合性を確認してからワールドマップを更新する。
+    ///
+    /// - 成熟平面に近い点: 平面へ射影して統合する。
+    /// - 成熟平面から少し離れた点: 二重壁候補として pending に保留する。
+    /// - 近くに成熟平面がない点: 新規構造の provisional voxel として追加する。
+    ///
+    /// pending は GlobalMap/ICP/PCD 出力には使わない。現在の目的は壁の厚み抑制を
+    /// 優先するため、近接した平行面を自動昇格させず、期限切れで破棄する。
+    pub fn update_world_map_filtered(
+        &mut self,
+        source_points: &[Point3<f32>],
+        global_pose: &Matrix4<f64>,
+        filter_config: &WorldMapUpdateFilterConfig,
+    ) -> WorldMapUpdateStats {
+        assert!(filter_config.accept_distance_m.is_finite());
+        assert!(filter_config.accept_distance_m > 0.0);
+        assert!(filter_config.pending_distance_m.is_finite());
+        assert!(filter_config.pending_distance_m >= filter_config.accept_distance_m);
+
+        let pose_f32 = global_pose.cast::<f32>();
+        let r_mat: Matrix3<f32> = pose_f32.fixed_view::<3, 3>(0, 0).into();
+        let t_vec: Vector3<f32> = pose_f32.fixed_view::<3, 1>(0, 3).into();
+        let origin = Point3::from(t_vec);
+        let frame_id = self.next_frame_id;
+
+        let map_ref: &LOCALMap = &*self;
+        let decisions: Vec<WorldPointUpdateDecision> = source_points
+            .par_iter()
+            .map(|source_point| {
+                if !source_point.coords.iter().all(|value| value.is_finite()) {
+                    return WorldPointUpdateDecision::RejectNonFinite;
+                }
+
+                let world_point = Point3::from(r_mat * source_point.coords + t_vec);
+                map_ref.classify_world_point_update(world_point, filter_config)
+            })
+            .collect();
+
+        let mut stats = WorldMapUpdateStats {
+            input_points: source_points.len(),
+            ..WorldMapUpdateStats::default()
+        };
+        let mut accepted_world_points = Vec::with_capacity(source_points.len());
+        let mut pending_frame_voxels: FxHashMap<VoxelKey, (Vector3<f32>, usize)> =
+            FxHashMap::default();
+
+        for decision in decisions {
+            match decision {
+                WorldPointUpdateDecision::InsertProvisional(point) => {
+                    accepted_world_points.push(point);
+                    self.pending_voxel_map
+                        .remove(&voxel_key(&point, self.config.index_voxel_size));
+                    stats.inserted_provisional += 1;
+                }
+                WorldPointUpdateDecision::InsertOnMaturePlane {
+                    original,
+                    insertion,
+                } => {
+                    accepted_world_points.push(insertion);
+                    self.pending_voxel_map.remove(&voxel_key(
+                        &original,
+                        self.config.index_voxel_size,
+                    ));
+                    stats.projected_to_mature_plane += 1;
+                }
+                WorldPointUpdateDecision::HoldPending(point) => {
+                    let key = voxel_key(&point, self.config.index_voxel_size);
+                    pending_frame_voxels
+                        .entry(key)
+                        .and_modify(|(sum, count)| {
+                            *sum += point.coords;
+                            *count += 1;
+                        })
+                        .or_insert((point.coords, 1));
+                    stats.held_pending += 1;
+                }
+                WorldPointUpdateDecision::RejectNonFinite => {
+                    stats.rejected_non_finite += 1;
+                }
+            }
+        }
+
+        for (key, (sum, count)) in pending_frame_voxels {
+            let frame_mean = Point3::from(sum / count as f32);
+            match self.pending_voxel_map.entry(key) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(PendingVoxelCell::new(frame_mean, frame_id));
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    entry.get_mut().update(frame_mean, frame_id);
+                }
+            }
+        }
+
+        let frame_entry = self.insert_world_points(&accepted_world_points, origin);
+        self.frame_index.push_back(frame_entry);
+
+        self.pending_voxel_map.retain(|_, pending| {
+            frame_id.saturating_sub(pending.last_observed_frame_id)
+                <= filter_config.pending_max_age_frames
+        });
+        stats.pending_voxels = self.pending_voxel_map.len();
+        stats
+    }
+
+    pub fn pending_voxel_count(&self) -> usize {
+        self.pending_voxel_map.len()
+    }
+
+    fn classify_world_point_update(
+        &self,
+        world_point: Point3<f32>,
+        config: &WorldMapUpdateFilterConfig,
+    ) -> WorldPointUpdateDecision {
+        let Some(plane) = self.find_nearest_mature_plane(&world_point, config) else {
+            return WorldPointUpdateDecision::InsertProvisional(world_point);
+        };
+
+        let signed_distance = plane.normal.dot(&world_point.coords) + plane.d;
+        let absolute_distance = signed_distance.abs();
+
+        if absolute_distance <= config.accept_distance_m {
+            let insertion = if config.project_accepted_points {
+                Point3::from(world_point.coords - plane.normal * signed_distance)
+            } else {
+                world_point
+            };
+            WorldPointUpdateDecision::InsertOnMaturePlane {
+                original: world_point,
+                insertion,
+            }
+        } else {
+            WorldPointUpdateDecision::HoldPending(world_point)
+        }
+    }
+
+    fn find_nearest_mature_plane(
+        &self,
+        world_point: &Point3<f32>,
+        config: &WorldMapUpdateFilterConfig,
+    ) -> Option<SurfacePlane> {
+        let center_key = voxel_key(world_point, self.config.index_voxel_size);
+        let radius = config.mature_plane_search_radius_voxels.max(0);
+        let mut best: Option<(SurfacePlane, f32)> = None;
+
+        for dz in -radius..=radius {
+            for dy in -radius..=radius {
+                for dx in -radius..=radius {
+                    let key = VoxelKey {
+                        ix: center_key.ix + dx,
+                        iy: center_key.iy + dy,
+                        iz: center_key.iz + dz,
+                    };
+                    let Some(cell) = self.voxel_map.get(&key) else {
+                        continue;
+                    };
+                    if cell.surface_status != SurfaceStatus::Planar
+                        || cell.observed_frames < config.min_mature_observed_frames
+                    {
+                        continue;
+                    }
+                    let Some(plane) = cell.surface_plane else {
+                        continue;
+                    };
+
+                    let distance = (plane.normal.dot(&world_point.coords) + plane.d).abs();
+                    if !distance.is_finite() || distance > config.pending_distance_m {
+                        continue;
+                    }
+
+                    let replace = best.map_or(true, |(current, current_distance)| {
+                        distance < current_distance
+                            || (distance == current_distance && plane.rmse_m < current.rmse_m)
+                    });
+                    if replace {
+                        best = Some((plane, distance));
+                    }
+                }
+            }
+        }
+
+        best.map(|(plane, _)| plane)
     }
 
     /// 現在フレームから `delay_frames` 以上古い更新領域を、現在までの累積点で再判定する。
@@ -776,6 +1036,17 @@ mod tests {
         }
     }
 
+    fn world_update_filter_config() -> WorldMapUpdateFilterConfig {
+        WorldMapUpdateFilterConfig {
+            mature_plane_search_radius_voxels: 2,
+            min_mature_observed_frames: 3,
+            accept_distance_m: 0.02,
+            pending_distance_m: 0.10,
+            project_accepted_points: true,
+            pending_max_age_frames: 2,
+        }
+    }
+
     fn insert_test_cell(map: &mut LOCALMap, key: VoxelKey, point: Point3<f32>) {
         let mut cell = VoxelCell::from_key(&key, map.config.index_voxel_size, point, 1);
         cell.sample_count = 2;
@@ -799,6 +1070,31 @@ mod tests {
                 insert_test_cell(map, key, Point3::new(ix as f32 * 0.05, iy as f32 * 0.05, z));
             }
         }
+    }
+
+    fn insert_mature_yz_plane_cell(map: &mut LOCALMap) {
+        let key = VoxelKey {
+            ix: 0,
+            iy: 0,
+            iz: 0,
+        };
+        let mut cell = VoxelCell::from_key(
+            &key,
+            map.config.index_voxel_size,
+            Point3::origin(),
+            0,
+        );
+        cell.sample_count = 5;
+        cell.observed_frames = 5;
+        cell.surface_status = SurfaceStatus::Planar;
+        cell.surface_plane = Some(SurfacePlane {
+            normal: Vector3::new(1.0, 0.0, 0.0),
+            d: 0.0,
+            rmse_m: 0.005,
+            neighbor_count: 20,
+            inlier_count: 18,
+        });
+        map.voxel_map.insert(key, cell);
     }
 
     #[test]
@@ -945,5 +1241,67 @@ mod tests {
         );
         assert_eq!(map.frame_index.len(), 2);
         assert_eq!(map.frame_index.front().unwrap().frame_id, 1);
+    }
+
+    #[test]
+    fn filtered_world_update_projects_observation_onto_mature_plane() {
+        let mut map = LOCALMap::new(map_config());
+        insert_mature_yz_plane_cell(&mut map);
+
+        let stats = map.update_world_map_filtered(
+            &[Point3::new(0.015, 0.01, 0.01)],
+            &Matrix4::<f64>::identity(),
+            &world_update_filter_config(),
+        );
+
+        assert_eq!(stats.projected_to_mature_plane, 1);
+        assert_eq!(stats.held_pending, 0);
+        let updated = map
+            .voxel_map
+            .get(&VoxelKey {
+                ix: 0,
+                iy: 0,
+                iz: 0,
+            })
+            .unwrap();
+        assert!(updated.mean.x.abs() < 1e-6);
+    }
+
+    #[test]
+    fn filtered_world_update_holds_seven_centimeter_parallel_layer() {
+        let mut map = LOCALMap::new(map_config());
+        insert_mature_yz_plane_cell(&mut map);
+        let original_voxel_count = map.voxel_map.len();
+
+        let stats = map.update_world_map_filtered(
+            &[Point3::new(0.07, 0.01, 0.01)],
+            &Matrix4::<f64>::identity(),
+            &world_update_filter_config(),
+        );
+
+        assert_eq!(stats.held_pending, 1);
+        assert_eq!(stats.projected_to_mature_plane, 0);
+        assert_eq!(stats.pending_voxels, 1);
+        assert_eq!(map.voxel_map.len(), original_voxel_count);
+        assert!(!map.voxel_map.contains_key(&VoxelKey {
+            ix: 1,
+            iy: 0,
+            iz: 0,
+        }));
+    }
+
+    #[test]
+    fn filtered_world_update_keeps_new_structure_without_nearby_mature_plane() {
+        let mut map = LOCALMap::new(map_config());
+
+        let stats = map.update_world_map_filtered(
+            &[Point3::new(1.0, 0.0, 0.0)],
+            &Matrix4::<f64>::identity(),
+            &world_update_filter_config(),
+        );
+
+        assert_eq!(stats.inserted_provisional, 1);
+        assert_eq!(stats.held_pending, 0);
+        assert_eq!(map.voxel_map.len(), 1);
     }
 }
