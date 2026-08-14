@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use nalgebra::{Matrix3, Matrix4, Point3, Quaternion, UnitQuaternion, Vector3};
 use re_lidar_slam::{
     deskew_points::deskew_points,
@@ -8,15 +8,97 @@ use re_lidar_slam::{
     predict_pose_by_imu::{align_imu_timestamps, build_rotation_trajectory, predict_pose_by_imu},
     types::{CurrentFrameInfo, FrameLog, PointXYZ, SLAMMap},
     voxel_map::{
-        LOCALMap, LocalMapConfig, SurfaceFilterConfig, SurfaceStatus,
-        WorldMapUpdateFilterConfig, build_voxel_map,
+        LOCALMap, LocalMapConfig, SurfaceFilterConfig, SurfaceStatus, WorldMapUpdateFilterConfig,
+        build_voxel_map,
     },
     voxelization::voxel_downsample_points,
 };
-use std::time::{Duration, Instant};
+use std::{
+    ffi::OsString,
+    time::{Duration, Instant},
+};
 
-const LOAD_DIR: &str = "data/input/08082026/08012026-airy96-mid70-06/mid-70"; // /home/kenji/mnt/nfs/share/airy96/06212026/park05
-const SAVE_DIR: &str = "data/output/debug/08082026";
+const DATASET_DIR: &str = "data/input/08082026/08012026-airy96-mid70-06";
+const SAVE_ROOT_DIR: &str = "data/output/debug/08082026";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LidarModel {
+    Mid70,
+    Airy96,
+}
+
+impl LidarModel {
+    fn parse(value: &str) -> Result<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "mid70" | "mid-70" => Ok(Self::Mid70),
+            "airy96" | "airy-96" | "airy" => Ok(Self::Airy96),
+            _ => bail!("unsupported LiDAR model '{value}'; expected 'mid70' or 'airy96'"),
+        }
+    }
+
+    fn input_subdir(self) -> &'static str {
+        match self {
+            Self::Mid70 => "mid-70",
+            Self::Airy96 => "airy",
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Mid70 => "mid70",
+            Self::Airy96 => "airy96",
+        }
+    }
+
+    fn imu_to_lidar_rotation(self) -> UnitQuaternion<f64> {
+        match self {
+            Self::Mid70 => make_imu_to_mid70_rotation(),
+            Self::Airy96 => make_imu_to_airy96_rotation(),
+        }
+    }
+}
+
+enum CommandLineAction {
+    Run(LidarModel),
+    Help,
+}
+
+fn parse_command_line<I>(args: I) -> Result<CommandLineAction>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut lidar_model = LidarModel::Mid70;
+    let mut args = args.into_iter();
+
+    while let Some(argument) = args.next() {
+        let argument = argument
+            .into_string()
+            .map_err(|_| anyhow::anyhow!("command-line arguments must be valid UTF-8"))?;
+
+        match argument.as_str() {
+            "-h" | "--help" => return Ok(CommandLineAction::Help),
+            "--lidar" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--lidar requires 'mid70' or 'airy96'"))?
+                    .into_string()
+                    .map_err(|_| anyhow::anyhow!("LiDAR model must be valid UTF-8"))?;
+                lidar_model = LidarModel::parse(&value)?;
+            }
+            _ if argument.starts_with("--lidar=") => {
+                lidar_model = LidarModel::parse(&argument["--lidar=".len()..])?;
+            }
+            _ => bail!("unknown argument '{argument}'; use --help for usage"),
+        }
+    }
+
+    Ok(CommandLineAction::Run(lidar_model))
+}
+
+fn print_usage() {
+    println!("Usage: re_lidar_slam [--lidar <mid70|airy96>]");
+    println!("  --lidar  Select the point-cloud sensor (default: mid70)");
+}
 
 // Mid-70 sparse-cloud preset.
 // The upper range matches the range used by the existing Mid-70 datasets.
@@ -93,8 +175,25 @@ const MAX_DIST_FOR_VOXEL_MAP: f32 = 150.0;
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
 
+    let lidar_model = match parse_command_line(std::env::args_os().skip(1))? {
+        CommandLineAction::Run(lidar_model) => lidar_model,
+        CommandLineAction::Help => {
+            print_usage();
+            return Ok(());
+        }
+    };
+    let load_dir = format!("{DATASET_DIR}/{}", lidar_model.input_subdir());
+    let save_dir = format!("{SAVE_ROOT_DIR}/{}", lidar_model.name());
+    let imu_to_lidar = lidar_model.imu_to_lidar_rotation();
+    log::info!(
+        "LiDAR model={}, input={}, output={}",
+        lidar_model.name(),
+        load_dir,
+        save_dir,
+    );
+
     // <--- Loading each data --->
-    let pcd_dir = format!("{}/pcd", LOAD_DIR);
+    let pcd_dir = format!("{load_dir}/pcd");
     let pcd_files = load_pcd_files(&pcd_dir)?;
 
     log::debug!(
@@ -103,14 +202,11 @@ fn main() -> Result<()> {
         pcd_dir
     );
 
-    let imu_dir = format!("{}/imu", LOAD_DIR);
+    let imu_dir = format!("{load_dir}/imu");
     let imu_file = format!("{}/imu_data.json", imu_dir);
     let imu_data = load_imu_data(&imu_file)?;
     let imu_data = align_imu_timestamps(&imu_data); // Align IMU timestamps to seconds
     // <--- Loading each data --->
-
-    // Airy-96内蔵IMUの角速度・加速度をMid-70座標へ変換する回転。
-    let imu_to_mid70 = make_imu_to_mid70_rotation();
 
     // <--- Initialize current frame info --->
     let mut current_frame_info = CurrentFrameInfo {
@@ -198,7 +294,7 @@ fn main() -> Result<()> {
         let predict_pose_start = Instant::now();
         let pose_prediction = predict_pose_by_imu(
             &imu_data,
-            &imu_to_mid70,
+            &imu_to_lidar,
             &current_frame_info.current_global_pose,
             &current_frame_info.current_velocity,
             prev_frame_start_time,
@@ -213,7 +309,7 @@ fn main() -> Result<()> {
             &imu_data,
             current_frame_start_time,
             current_frame_end_time,
-            &imu_to_mid70,
+            &imu_to_lidar,
         );
         let rotation_trajectory_time = rotation_trajectory_start.elapsed();
         // <--- Build rotation trajectory --->
@@ -223,7 +319,7 @@ fn main() -> Result<()> {
         let deskewed_points = deskew_points(
             &source_pcd,
             &rotation_traj,
-            &imu_to_mid70,
+            &imu_to_lidar,
             current_frame_start_time,
             MIN_DIST,
             MAX_DIST,
@@ -555,10 +651,10 @@ fn main() -> Result<()> {
             })
             .collect();
 
-    std::fs::create_dir_all(SAVE_DIR)?;
+    std::fs::create_dir_all(&save_dir)?;
     let world_map_before_plane_filter_path = format!(
         "{}/voxel-{}_world_map_before_plane_filter.pcd",
-        SAVE_DIR, GLOBAL_MAP_VOXEL_SIZE
+        save_dir, GLOBAL_MAP_VOXEL_SIZE
     );
     save_pcd_xyz(
         &world_map_points_before_plane_filter_xyz,
@@ -610,7 +706,7 @@ fn main() -> Result<()> {
 
     // 既存ファイル名は平面処理後の最終マップとして維持する。
     let planar_world_map_path =
-        format!("{}/voxel-{}_world_map.pcd", SAVE_DIR, GLOBAL_MAP_VOXEL_SIZE);
+        format!("{}/voxel-{}_world_map.pcd", save_dir, GLOBAL_MAP_VOXEL_SIZE);
     save_pcd_xyz(&planar_world_map_points_xyz, &planar_world_map_path)?;
     log::info!(
         "Saved planar world map: {} → {} points → {}",
@@ -621,7 +717,7 @@ fn main() -> Result<()> {
     // --- Save the global voxel maps before and after final plane classification ---
 
     // --- Save per-frame ICP logs to JSON ---
-    let frame_logs_path = format!("{}/frame_logs.json", SAVE_DIR);
+    let frame_logs_path = format!("{}/frame_logs.json", save_dir);
     let frame_logs_json = serde_json::to_string_pretty(&frame_logs)?;
     std::fs::write(&frame_logs_path, &frame_logs_json)?;
     log::info!(
@@ -660,12 +756,7 @@ fn make_airy96_from_mid70_extrinsic() -> Matrix4<f64> {
 ///
 /// `R_mid70_from_imu = R_mid70_from_airy96 * R_airy96_from_imu`
 fn make_imu_to_mid70_rotation() -> UnitQuaternion<f64> {
-    let imu_to_airy96 = UnitQuaternion::new_normalize(Quaternion::new(
-        IMU_TO_AIRY96_QUAT_W,
-        IMU_TO_AIRY96_QUAT_X,
-        IMU_TO_AIRY96_QUAT_Y,
-        IMU_TO_AIRY96_QUAT_Z,
-    ));
+    let imu_to_airy96 = make_imu_to_airy96_rotation();
     let airy96_from_mid70 = make_airy96_from_mid70_extrinsic();
     let airy96_from_mid70_rotation =
         UnitQuaternion::from_matrix(&airy96_from_mid70.fixed_view::<3, 3>(0, 0).into_owned());
@@ -673,13 +764,61 @@ fn make_imu_to_mid70_rotation() -> UnitQuaternion<f64> {
     airy96_from_mid70_rotation.inverse() * imu_to_airy96
 }
 
+/// Airy-96内蔵IMU座標からAiry-96 LiDAR座標への回転を返す。
+fn make_imu_to_airy96_rotation() -> UnitQuaternion<f64> {
+    UnitQuaternion::new_normalize(Quaternion::new(
+        IMU_TO_AIRY96_QUAT_W,
+        IMU_TO_AIRY96_QUAT_X,
+        IMU_TO_AIRY96_QUAT_Y,
+        IMU_TO_AIRY96_QUAT_Z,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+
     use nalgebra::{Point3, Vector3};
 
     use super::{
-        MID70_ORIGIN_IN_AIRY96_Z_M, make_airy96_from_mid70_extrinsic, make_imu_to_mid70_rotation,
+        CommandLineAction, LidarModel, MID70_ORIGIN_IN_AIRY96_Z_M,
+        make_airy96_from_mid70_extrinsic, make_imu_to_airy96_rotation, make_imu_to_mid70_rotation,
+        parse_command_line,
     };
+
+    fn parse_args(args: &[&str]) -> anyhow::Result<CommandLineAction> {
+        parse_command_line(args.iter().map(OsString::from))
+    }
+
+    #[test]
+    fn command_line_defaults_to_mid70() {
+        let CommandLineAction::Run(model) = parse_args(&[]).unwrap() else {
+            panic!("expected run action");
+        };
+        assert_eq!(model, LidarModel::Mid70);
+    }
+
+    #[test]
+    fn command_line_selects_airy96() {
+        let CommandLineAction::Run(model) = parse_args(&["--lidar", "airy96"]).unwrap() else {
+            panic!("expected run action");
+        };
+        assert_eq!(model, LidarModel::Airy96);
+
+        let CommandLineAction::Run(model) = parse_args(&["--lidar=airy"]).unwrap() else {
+            panic!("expected run action");
+        };
+        assert_eq!(model, LidarModel::Airy96);
+    }
+
+    #[test]
+    fn command_line_rejects_unknown_lidar() {
+        let error = match parse_args(&["--lidar", "unknown"]) {
+            Ok(_) => panic!("unknown LiDAR model must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("expected 'mid70' or 'airy96'"));
+    }
 
     #[test]
     fn mid70_extrinsic_maps_axes_into_airy96_coordinates() {
@@ -700,12 +839,7 @@ mod tests {
         let airy96_from_mid70_rotation = airy96_from_mid70.fixed_view::<3, 3>(0, 0).into_owned();
 
         let via_mid70 = airy96_from_mid70_rotation * (imu_to_mid70 * imu_vector);
-        let imu_to_airy96 = super::UnitQuaternion::new_normalize(super::Quaternion::new(
-            super::IMU_TO_AIRY96_QUAT_W,
-            super::IMU_TO_AIRY96_QUAT_X,
-            super::IMU_TO_AIRY96_QUAT_Y,
-            super::IMU_TO_AIRY96_QUAT_Z,
-        ));
+        let imu_to_airy96 = make_imu_to_airy96_rotation();
         let direct = imu_to_airy96 * imu_vector;
 
         assert!((via_mid70 - direct).norm() < 1e-12);
