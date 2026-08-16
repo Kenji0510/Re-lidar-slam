@@ -18,8 +18,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-const DATASET_DIR: &str = "data/input/08082026/08012026-airy96-mid70-06";
-const SAVE_ROOT_DIR: &str = "data/output/debug/08082026";
+const DATASET_DIR: &str = "data/input/08152026/08012026-airy96-mid70-09";
+const SAVE_ROOT_DIR: &str = "data/output/debug/08152026";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LidarModel {
