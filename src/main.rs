@@ -6,7 +6,7 @@ use re_lidar_slam::{
     find_nearest_points::pickup_valid_source_points,
     icp::{apply_delta, build_point_to_plane_system, compute_rmse, solve_icp_delta},
     predict_pose_by_imu::{align_imu_timestamps, build_rotation_trajectory, predict_pose_by_imu},
-    types::{CurrentFrameInfo, FrameLog, PointXYZ, SLAMMap},
+    types::{CurrentFrameInfo, FrameLog, IMU, PointXYZ, SLAMMap},
     voxel_map::{
         LOCALMap, LocalMapConfig, SurfaceFilterConfig, SurfaceStatus, WorldMapUpdateFilterConfig,
         build_voxel_map,
@@ -18,7 +18,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const DATASET_DIR: &str = "data/input/08152026/08012026-airy96-mid70-09";
+const DATASET_DIR: &str = "/mnt/nas/share/airy96/08152026/pcd/08012026-airy96-01";
 const SAVE_ROOT_DIR: &str = "data/output/debug/08152026";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,8 +169,20 @@ const WORLD_UPDATE_PENDING_MAX_AGE_FRAMES: u64 = 30;
 const ICP_ITERATIONS: usize = 8;
 const ICP_RMSE_THRESHOLD: f32 = 0.10; // Absolute point-to-plane RMSE convergence threshold [m]
 const ICP_RMSE_DIVERGE_THRESHOLD: f32 = 1.0; // Reject ICP and fall back to IMU prediction [m]
+const MIN_IMU_SAMPLES_PER_POINT_CLOUD_FRAME: usize = 5;
 
 const MAX_DIST_FOR_VOXEL_MAP: f32 = 150.0;
+
+fn count_imu_samples_in_time_range(imu_data: &[IMU], start_time: f64, end_time: f64) -> usize {
+    if !start_time.is_finite() || !end_time.is_finite() || start_time > end_time {
+        return 0;
+    }
+
+    let start_idx = imu_data.partition_point(|sample| sample.timestamp < start_time);
+    let end_idx = imu_data.partition_point(|sample| sample.timestamp <= end_time);
+
+    end_idx.saturating_sub(start_idx)
+}
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
@@ -285,6 +297,20 @@ fn main() -> Result<()> {
             .map(|p| p.timestamp)
             .fold(f64::NEG_INFINITY, f64::max);
         let timestamp_time = timestamp_start.elapsed();
+
+        let imu_sample_count = count_imu_samples_in_time_range(
+            &imu_data,
+            current_frame_start_time,
+            current_frame_end_time,
+        );
+        if imu_sample_count < MIN_IMU_SAMPLES_PER_POINT_CLOUD_FRAME {
+            log::warn!(
+                "Frame {i}: only {imu_sample_count} IMU samples in point-cloud interval \
+                 [{current_frame_start_time:.6}, {current_frame_end_time:.6}] s \
+                 (minimum {MIN_IMU_SAMPLES_PER_POINT_CLOUD_FRAME}); \
+                 IMU/LiDAR timestamps may be misaligned"
+            );
+        }
 
         if i == 0 {
             prev_frame_start_time = current_frame_start_time;
@@ -781,10 +807,18 @@ mod tests {
     use nalgebra::{Point3, Vector3};
 
     use super::{
-        CommandLineAction, LidarModel, MID70_ORIGIN_IN_AIRY96_Z_M,
-        make_airy96_from_mid70_extrinsic, make_imu_to_airy96_rotation, make_imu_to_mid70_rotation,
-        parse_command_line,
+        CommandLineAction, IMU, LidarModel, MID70_ORIGIN_IN_AIRY96_Z_M,
+        count_imu_samples_in_time_range, make_airy96_from_mid70_extrinsic,
+        make_imu_to_airy96_rotation, make_imu_to_mid70_rotation, parse_command_line,
     };
+
+    fn imu_sample(timestamp: f64) -> IMU {
+        IMU {
+            timestamp,
+            angular_velocity: [0.0; 3],
+            linear_acceleration: [0.0; 3],
+        }
+    }
 
     fn parse_args(args: &[&str]) -> anyhow::Result<CommandLineAction> {
         parse_command_line(args.iter().map(OsString::from))
@@ -818,6 +852,21 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("expected 'mid70' or 'airy96'"));
+    }
+
+    #[test]
+    fn counts_imu_samples_inside_inclusive_point_cloud_interval() {
+        let imu_data = [
+            imu_sample(0.9),
+            imu_sample(1.0),
+            imu_sample(1.5),
+            imu_sample(2.0),
+            imu_sample(2.1),
+        ];
+
+        assert_eq!(count_imu_samples_in_time_range(&imu_data, 1.0, 2.0), 3);
+        assert_eq!(count_imu_samples_in_time_range(&imu_data, 3.0, 4.0), 0);
+        assert_eq!(count_imu_samples_in_time_range(&imu_data, 2.0, 1.0), 0);
     }
 
     #[test]
