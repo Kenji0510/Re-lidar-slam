@@ -1,4 +1,7 @@
-use std::collections::VecDeque;
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
 
 use nalgebra::{Matrix3, Matrix4, Point3, Vector3};
 use rayon::prelude::*;
@@ -530,7 +533,8 @@ impl LOCALMap {
         filter_config: &SurfaceFilterConfig,
     ) -> SurfaceClassificationStats {
         let center_keys: Vec<VoxelKey> = self.voxel_map.keys().copied().collect();
-        self.classify_surface_voxels(&center_keys, filter_config)
+        self.classify_surface_voxels(&center_keys, filter_config, false)
+            .0
     }
 
     fn classify_surface_voxels_affected_by(
@@ -542,6 +546,9 @@ impl LOCALMap {
             return SurfaceClassificationStats::default();
         }
 
+        let profile_enabled = log::log_enabled!(log::Level::Debug);
+        let total_start = profile_enabled.then(Instant::now);
+        let candidate_generation_start = profile_enabled.then(Instant::now);
         let radius = filter_config.neighbor_radius_voxels.max(0);
         let mut center_keys = FxHashSet::default();
 
@@ -563,20 +570,59 @@ impl LOCALMap {
             }
         }
 
+        let candidate_generation_wall = candidate_generation_start
+            .map(|start| start.elapsed())
+            .unwrap_or_default();
         let center_keys: Vec<VoxelKey> = center_keys.into_iter().collect();
-        self.classify_surface_voxels(&center_keys, filter_config)
+        let center_count = center_keys.len();
+        let (stats, timings) =
+            self.classify_surface_voxels(&center_keys, filter_config, profile_enabled);
+
+        if profile_enabled {
+            let neighborhood_width = (radius as usize).saturating_mul(2).saturating_add(1);
+            let candidate_probes = dirty_keys.len().saturating_mul(
+                neighborhood_width
+                    .saturating_mul(neighborhood_width)
+                    .saturating_mul(neighborhood_width),
+            );
+            let total_wall = total_start.map(|start| start.elapsed()).unwrap_or_default();
+            log::debug!(
+                "Delayed surface profile: dirty={}, candidate_probes={}, centers={}, \
+                 evaluated={}, candidate_generation_wall_ms={:.3}, \
+                 parallel_evaluation_wall_ms={:.3}, neighborhood_cpu_sum_ms={:.3}, \
+                 ransac_cpu_sum_ms={:.3}, pca_cpu_sum_ms={:.3}, \
+                 evaluation_other_cpu_sum_ms={:.3}, result_apply_wall_ms={:.3}, \
+                 total_wall_ms={:.3}",
+                dirty_keys.len(),
+                candidate_probes,
+                center_count,
+                stats.evaluated,
+                duration_ms(candidate_generation_wall),
+                duration_ms(timings.parallel_evaluation_wall),
+                duration_ms(timings.neighborhood_cpu_sum),
+                duration_ms(timings.ransac_cpu_sum),
+                duration_ms(timings.pca_cpu_sum),
+                duration_ms(timings.evaluation_other_cpu_sum),
+                duration_ms(timings.result_apply_wall),
+                duration_ms(total_wall),
+            );
+        }
+
+        stats
     }
 
     fn classify_surface_voxels(
         &mut self,
         center_keys: &[VoxelKey],
         filter_config: &SurfaceFilterConfig,
-    ) -> SurfaceClassificationStats {
+        profile_enabled: bool,
+    ) -> (SurfaceClassificationStats, SurfaceClassificationTimings) {
         let radius = filter_config.neighbor_radius_voxels.max(0) as usize;
         let neighborhood_width = radius * 2 + 1;
         let max_neighbor_points = neighborhood_width
             .saturating_mul(neighborhood_width)
             .saturating_mul(neighborhood_width);
+        let parallel_evaluation_start = profile_enabled.then(Instant::now);
         let evaluations: Vec<(VoxelKey, SurfaceEvaluation)> = {
             let voxel_map = &self.voxel_map;
             center_keys
@@ -584,14 +630,32 @@ impl LOCALMap {
                 .map_init(
                     || SurfaceEvaluationScratch::with_capacity(max_neighbor_points),
                     |scratch, key| {
-                        evaluate_surface_voxel(voxel_map, *key, filter_config, scratch)
-                            .map(|evaluation| (*key, evaluation))
+                        evaluate_surface_voxel(
+                            voxel_map,
+                            *key,
+                            filter_config,
+                            scratch,
+                            profile_enabled,
+                        )
+                        .map(|evaluation| (*key, evaluation))
                     },
                 )
                 .filter_map(|evaluation| evaluation)
                 .collect()
         };
+        let parallel_evaluation_wall = parallel_evaluation_start
+            .map(|start| start.elapsed())
+            .unwrap_or_default();
 
+        let evaluation_cpu_sums = evaluations.iter().fold(
+            SurfaceEvaluationTimings::default(),
+            |mut total, (_, evaluation)| {
+                total.add_assign(evaluation.timings);
+                total
+            },
+        );
+
+        let result_apply_start = profile_enabled.then(Instant::now);
         let mut stats = SurfaceClassificationStats::default();
         for (key, evaluation) in evaluations {
             let Some(cell) = self.voxel_map.get_mut(&key) else {
@@ -607,8 +671,21 @@ impl LOCALMap {
                 SurfaceStatus::NonPlanar => stats.non_planar += 1,
             }
         }
+        let result_apply_wall = result_apply_start
+            .map(|start| start.elapsed())
+            .unwrap_or_default();
 
-        stats
+        (
+            stats,
+            SurfaceClassificationTimings {
+                parallel_evaluation_wall,
+                neighborhood_cpu_sum: evaluation_cpu_sums.neighborhood,
+                ransac_cpu_sum: evaluation_cpu_sums.ransac,
+                pca_cpu_sum: evaluation_cpu_sums.pca,
+                evaluation_other_cpu_sum: evaluation_cpu_sums.other(),
+                result_apply_wall,
+            },
+        )
     }
 }
 
@@ -616,6 +693,41 @@ impl LOCALMap {
 struct SurfaceEvaluation {
     status: SurfaceStatus,
     plane: Option<SurfacePlane>,
+    timings: SurfaceEvaluationTimings,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SurfaceEvaluationTimings {
+    total: Duration,
+    neighborhood: Duration,
+    ransac: Duration,
+    pca: Duration,
+}
+
+impl SurfaceEvaluationTimings {
+    fn add_assign(&mut self, other: Self) {
+        self.total += other.total;
+        self.neighborhood += other.neighborhood;
+        self.ransac += other.ransac;
+        self.pca += other.pca;
+    }
+
+    fn other(self) -> Duration {
+        self.total
+            .saturating_sub(self.neighborhood)
+            .saturating_sub(self.ransac)
+            .saturating_sub(self.pca)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SurfaceClassificationTimings {
+    parallel_evaluation_wall: Duration,
+    neighborhood_cpu_sum: Duration,
+    ransac_cpu_sum: Duration,
+    pca_cpu_sum: Duration,
+    evaluation_other_cpu_sum: Duration,
+    result_apply_wall: Duration,
 }
 
 struct SurfaceEvaluationScratch {
@@ -637,7 +749,10 @@ fn evaluate_surface_voxel(
     center_key: VoxelKey,
     config: &SurfaceFilterConfig,
     scratch: &mut SurfaceEvaluationScratch,
+    profile_enabled: bool,
 ) -> Option<SurfaceEvaluation> {
+    let evaluation_start = profile_enabled.then(Instant::now);
+    let mut timings = SurfaceEvaluationTimings::default();
     scratch.neighbor_points.clear();
     scratch.inlier_points.clear();
 
@@ -646,9 +761,11 @@ fn evaluate_surface_voxel(
         return Some(SurfaceEvaluation {
             status: SurfaceStatus::Unknown,
             plane: None,
+            timings: finish_evaluation_timing(timings, evaluation_start),
         });
     }
 
+    let neighborhood_start = profile_enabled.then(Instant::now);
     let radius = config.neighbor_radius_voxels.max(0);
     for dz in -radius..=radius {
         for dy in -radius..=radius {
@@ -664,24 +781,34 @@ fn evaluate_surface_voxel(
             }
         }
     }
+    timings.neighborhood = neighborhood_start
+        .map(|start| start.elapsed())
+        .unwrap_or_default();
 
     if scratch.neighbor_points.len() < config.min_neighbors {
         return Some(SurfaceEvaluation {
             status: SurfaceStatus::Unknown,
             plane: None,
+            timings: finish_evaluation_timing(timings, evaluation_start),
         });
     }
 
-    if !ransac_plane_inliers(
+    let ransac_start = profile_enabled.then(Instant::now);
+    let ransac_succeeded = ransac_plane_inliers(
         &scratch.neighbor_points,
         center_key,
         config.ransac_iterations,
         config.ransac_inlier_distance_m,
         &mut scratch.inlier_points,
-    ) {
+    );
+    timings.ransac = ransac_start
+        .map(|start| start.elapsed())
+        .unwrap_or_default();
+    if !ransac_succeeded {
         return Some(SurfaceEvaluation {
             status: SurfaceStatus::NonPlanar,
             plane: None,
+            timings: finish_evaluation_timing(timings, evaluation_start),
         });
     }
 
@@ -692,14 +819,19 @@ fn evaluate_surface_voxel(
         return Some(SurfaceEvaluation {
             status: SurfaceStatus::NonPlanar,
             plane: None,
+            timings: finish_evaluation_timing(timings, evaluation_start),
         });
     }
 
     // RANSAC で外れ値を除去した後の PCA は、この1回だけ実施する。
-    let Some(fitted_plane) = fit_plane(&scratch.inlier_points) else {
+    let pca_start = profile_enabled.then(Instant::now);
+    let fitted_plane = fit_plane(&scratch.inlier_points);
+    timings.pca = pca_start.map(|start| start.elapsed()).unwrap_or_default();
+    let Some(fitted_plane) = fitted_plane else {
         return Some(SurfaceEvaluation {
             status: SurfaceStatus::NonPlanar,
             plane: None,
+            timings: finish_evaluation_timing(timings, evaluation_start),
         });
     };
 
@@ -733,7 +865,22 @@ fn evaluate_surface_voxel(
             SurfaceStatus::NonPlanar
         },
         plane,
+        timings: finish_evaluation_timing(timings, evaluation_start),
     })
+}
+
+fn finish_evaluation_timing(
+    mut timings: SurfaceEvaluationTimings,
+    evaluation_start: Option<Instant>,
+) -> SurfaceEvaluationTimings {
+    timings.total = evaluation_start
+        .map(|start| start.elapsed())
+        .unwrap_or_default();
+    timings
+}
+
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1_000.0
 }
 
 /// 3点仮説を決定論的にサンプリングし、最多インライアを `inliers` に格納する。
