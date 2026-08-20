@@ -151,6 +151,8 @@ const SURFACE_MIN_NEIGHBORS: usize = 10;
 const SURFACE_MIN_RANSAC_INLIERS: usize = 8;
 const SURFACE_MIN_CENTER_OBSERVED_FRAMES: u64 = 2;
 const SURFACE_RANSAC_ITERATIONS: usize = 48;
+const SURFACE_RANSAC_CONFIDENCE: f64 = 0.999;
+const SURFACE_RANSAC_MIN_ITERATIONS: usize = 8;
 const SURFACE_RANSAC_INLIER_DISTANCE_M: f32 = 0.025;
 const SURFACE_MIN_INLIER_RATIO: f32 = 0.50;
 const SURFACE_MIN_PLANARITY: f32 = 0.20;
@@ -255,6 +257,8 @@ fn main() -> Result<()> {
         min_ransac_inliers: SURFACE_MIN_RANSAC_INLIERS,
         min_center_observed_frames: SURFACE_MIN_CENTER_OBSERVED_FRAMES,
         ransac_iterations: SURFACE_RANSAC_ITERATIONS,
+        ransac_confidence: SURFACE_RANSAC_CONFIDENCE,
+        ransac_min_iterations: SURFACE_RANSAC_MIN_ITERATIONS,
         ransac_inlier_distance_m: SURFACE_RANSAC_INLIER_DISTANCE_M,
         min_inlier_ratio: SURFACE_MIN_INLIER_RATIO,
         min_planarity: SURFACE_MIN_PLANARITY,

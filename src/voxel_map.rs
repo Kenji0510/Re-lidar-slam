@@ -58,6 +58,10 @@ pub struct SurfaceFilterConfig {
     pub min_ransac_inliers: usize,
     pub min_center_observed_frames: u64,
     pub ransac_iterations: usize,
+    /// 少なくとも1回、3点すべてがインライアとなる仮説を引く目標確率。
+    pub ransac_confidence: f64,
+    /// 適応的打ち切りを許可する最小反復数。
+    pub ransac_min_iterations: usize,
     /// RANSAC 仮説平面からこの距離以内の点を PCA 入力にする。
     pub ransac_inlier_distance_m: f32,
     pub min_inlier_ratio: f32,
@@ -594,32 +598,66 @@ impl LOCALMap {
                     .saturating_mul(neighborhood_width),
             );
             let total_wall = total_start.map(|start| start.elapsed()).unwrap_or_default();
+            let wall_overhead = total_wall
+                .saturating_sub(candidate_generation_wall)
+                .saturating_sub(timings.parallel_evaluation_wall)
+                .saturating_sub(timings.result_apply_wall);
+            let worker_time_sum = timings.neighborhood_cpu_sum
+                + timings.ransac_cpu_sum
+                + timings.pca_cpu_sum
+                + timings.evaluation_other_cpu_sum;
+            let effective_parallelism = ratio(
+                worker_time_sum.as_secs_f64(),
+                timings.parallel_evaluation_wall.as_secs_f64(),
+            );
+            let average_ransac_draws =
+                ratio(timings.ransac_draws as f64, timings.ransac_calls as f64);
+            let adaptive_stop_percent =
+                percentage(timings.ransac_adaptive_stops, timings.ransac_calls);
+            let point_test_total = timings
+                .ransac_point_tests
+                .saturating_add(timings.ransac_point_tests_skipped);
+            let point_test_skip_percent =
+                percentage(timings.ransac_point_tests_skipped, point_test_total);
+
             log::debug!(
-                "Delayed surface profile: dirty={}, candidate_probes={}, centers={}, \
-                 evaluated={}, candidate_generation_wall_ms={:.3}, \
-                 parallel_evaluation_wall_ms={:.3}, neighborhood_cpu_sum_ms={:.3}, \
-                 ransac_cpu_sum_ms={:.3}, pca_cpu_sum_ms={:.3}, \
-                 evaluation_other_cpu_sum_ms={:.3}, result_apply_wall_ms={:.3}, \
-                 ransac_draws={}, ransac_duplicate_skips={}, ransac_pruned={}, \
-                 ransac_point_tests={}, ransac_point_tests_skipped={}, \
-                 total_wall_ms={:.3}",
+                "Delayed surface wall [ms]: total={:.3}, candidates={:.3}, evaluation={:.3}, \
+                 apply={:.3}, overhead={:.3} | dirty={}, probes={}, centers={}, evaluated={}",
+                duration_ms(total_wall),
+                duration_ms(candidate_generation_wall),
+                duration_ms(timings.parallel_evaluation_wall),
+                duration_ms(timings.result_apply_wall),
+                duration_ms(wall_overhead),
                 dirty_keys.len(),
                 candidate_probes,
                 center_count,
                 stats.evaluated,
-                duration_ms(candidate_generation_wall),
-                duration_ms(timings.parallel_evaluation_wall),
+            );
+            log::debug!(
+                "Delayed surface worker sum [ms]: total={:.3}, neighbors={:.3}, ransac={:.3}, \
+                 pca={:.3}, other={:.3} | effective_parallelism={:.2}x",
+                duration_ms(worker_time_sum),
                 duration_ms(timings.neighborhood_cpu_sum),
                 duration_ms(timings.ransac_cpu_sum),
                 duration_ms(timings.pca_cpu_sum),
                 duration_ms(timings.evaluation_other_cpu_sum),
-                duration_ms(timings.result_apply_wall),
+                effective_parallelism,
+            );
+            log::debug!(
+                "Delayed surface RANSAC: calls={}, draws={} (avg={:.2}/{}), \
+                 adaptive_stops={} ({:.1}%), iterations_saved={}, pruned={}, \
+                 point_tests={}, point_tests_skipped={} ({:.1}%)",
+                timings.ransac_calls,
                 timings.ransac_draws,
-                timings.ransac_duplicate_skips,
+                average_ransac_draws,
+                filter_config.ransac_iterations,
+                timings.ransac_adaptive_stops,
+                adaptive_stop_percent,
+                timings.ransac_iterations_saved,
                 timings.ransac_pruned,
                 timings.ransac_point_tests,
                 timings.ransac_point_tests_skipped,
-                duration_ms(total_wall),
+                point_test_skip_percent,
             );
         }
 
@@ -643,12 +681,7 @@ impl LOCALMap {
             center_keys
                 .par_iter()
                 .map_init(
-                    || {
-                        SurfaceEvaluationScratch::with_capacity(
-                            max_neighbor_points,
-                            filter_config.ransac_iterations,
-                        )
-                    },
+                    || SurfaceEvaluationScratch::with_capacity(max_neighbor_points),
                     |scratch, key| {
                         evaluate_surface_voxel(
                             voxel_map,
@@ -704,11 +737,13 @@ impl LOCALMap {
                 pca_cpu_sum: evaluation_cpu_sums.pca,
                 evaluation_other_cpu_sum: evaluation_cpu_sums.other(),
                 result_apply_wall,
+                ransac_calls: evaluation_cpu_sums.ransac_calls,
                 ransac_draws: evaluation_cpu_sums.ransac_draws,
-                ransac_duplicate_skips: evaluation_cpu_sums.ransac_duplicate_skips,
                 ransac_pruned: evaluation_cpu_sums.ransac_pruned,
                 ransac_point_tests: evaluation_cpu_sums.ransac_point_tests,
                 ransac_point_tests_skipped: evaluation_cpu_sums.ransac_point_tests_skipped,
+                ransac_adaptive_stops: evaluation_cpu_sums.ransac_adaptive_stops,
+                ransac_iterations_saved: evaluation_cpu_sums.ransac_iterations_saved,
             },
         )
     }
@@ -739,11 +774,13 @@ struct SurfaceEvaluationTimings {
     neighborhood: Duration,
     ransac: Duration,
     pca: Duration,
+    ransac_calls: usize,
     ransac_draws: usize,
-    ransac_duplicate_skips: usize,
     ransac_pruned: usize,
     ransac_point_tests: usize,
     ransac_point_tests_skipped: usize,
+    ransac_adaptive_stops: usize,
+    ransac_iterations_saved: usize,
 }
 
 impl SurfaceEvaluationTimings {
@@ -752,11 +789,13 @@ impl SurfaceEvaluationTimings {
         self.neighborhood += other.neighborhood;
         self.ransac += other.ransac;
         self.pca += other.pca;
+        self.ransac_calls += other.ransac_calls;
         self.ransac_draws += other.ransac_draws;
-        self.ransac_duplicate_skips += other.ransac_duplicate_skips;
         self.ransac_pruned += other.ransac_pruned;
         self.ransac_point_tests += other.ransac_point_tests;
         self.ransac_point_tests_skipped += other.ransac_point_tests_skipped;
+        self.ransac_adaptive_stops += other.ransac_adaptive_stops;
+        self.ransac_iterations_saved += other.ransac_iterations_saved;
     }
 
     fn other(self) -> Duration {
@@ -775,27 +814,25 @@ struct SurfaceClassificationTimings {
     pca_cpu_sum: Duration,
     evaluation_other_cpu_sum: Duration,
     result_apply_wall: Duration,
+    ransac_calls: usize,
     ransac_draws: usize,
-    ransac_duplicate_skips: usize,
     ransac_pruned: usize,
     ransac_point_tests: usize,
     ransac_point_tests_skipped: usize,
+    ransac_adaptive_stops: usize,
+    ransac_iterations_saved: usize,
 }
 
 struct SurfaceEvaluationScratch {
     neighbor_points: Vec<Point3<f32>>,
     inlier_points: Vec<Point3<f32>>,
-    sampled_triplets: FxHashSet<[usize; 3]>,
 }
 
 impl SurfaceEvaluationScratch {
-    fn with_capacity(max_neighbor_points: usize, max_ransac_iterations: usize) -> Self {
-        let mut sampled_triplets = FxHashSet::default();
-        sampled_triplets.reserve(max_ransac_iterations);
+    fn with_capacity(max_neighbor_points: usize) -> Self {
         Self {
             neighbor_points: Vec::with_capacity(max_neighbor_points),
             inlier_points: Vec::with_capacity(max_neighbor_points),
-            sampled_triplets,
         }
     }
 }
@@ -854,18 +891,21 @@ fn evaluate_surface_voxel(
         &scratch.neighbor_points,
         center_key,
         config.ransac_iterations,
+        config.ransac_min_iterations,
+        config.ransac_confidence,
         config.ransac_inlier_distance_m,
         &mut scratch.inlier_points,
-        &mut scratch.sampled_triplets,
     );
     timings.ransac = ransac_start
         .map(|start| start.elapsed())
         .unwrap_or_default();
+    timings.ransac_calls = 1;
     timings.ransac_draws = ransac_outcome.draws;
-    timings.ransac_duplicate_skips = ransac_outcome.duplicate_hypotheses;
     timings.ransac_pruned = ransac_outcome.pruned_hypotheses;
     timings.ransac_point_tests = ransac_outcome.point_tests;
     timings.ransac_point_tests_skipped = ransac_outcome.point_tests_skipped;
+    timings.ransac_adaptive_stops = usize::from(ransac_outcome.adaptive_stopped);
+    timings.ransac_iterations_saved = ransac_outcome.iterations_saved;
     if !ransac_outcome.found {
         return Some(SurfaceEvaluation {
             status: SurfaceStatus::NonPlanar,
@@ -945,14 +985,27 @@ fn duration_ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
 }
 
+fn ratio(numerator: f64, denominator: f64) -> f64 {
+    if denominator > 0.0 {
+        numerator / denominator
+    } else {
+        0.0
+    }
+}
+
+fn percentage(part: usize, total: usize) -> f64 {
+    ratio(part as f64, total as f64) * 100.0
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct RansacOutcome {
     found: bool,
     draws: usize,
-    duplicate_hypotheses: usize,
     pruned_hypotheses: usize,
     point_tests: usize,
     point_tests_skipped: usize,
+    adaptive_stopped: bool,
+    iterations_saved: usize,
 }
 
 /// 3点仮説を決定論的にサンプリングし、最多インライアを `inliers` に格納する。
@@ -961,12 +1014,12 @@ fn ransac_plane_inliers(
     points: &[Point3<f32>],
     center_key: VoxelKey,
     iterations: usize,
+    min_iterations: usize,
+    confidence: f64,
     inlier_distance_m: f32,
     inliers: &mut Vec<Point3<f32>>,
-    sampled_triplets: &mut FxHashSet<[usize; 3]>,
 ) -> RansacOutcome {
     inliers.clear();
-    sampled_triplets.clear();
     if points.len() < 3
         || iterations == 0
         || !inlier_distance_m.is_finite()
@@ -981,17 +1034,11 @@ fn ransac_plane_inliers(
     let mut best_inlier_count = 0;
     let mut best_squared_error = f32::INFINITY;
     let mut outcome = RansacOutcome::default();
+    let mut required_iterations = iterations;
 
-    for _ in 0..iterations {
+    while outcome.draws < iterations && outcome.draws < required_iterations {
         outcome.draws += 1;
-        let mut sample = sample_three_distinct_indices(&mut random_state, points.len());
-        sample.sort_unstable();
-        if !sampled_triplets.insert(sample) {
-            outcome.duplicate_hypotheses += 1;
-            continue;
-        }
-
-        let [i0, i1, i2] = sample;
+        let [i0, i1, i2] = sample_three_distinct_indices(&mut random_state, points.len());
         let p0 = points[i0];
         let v1 = points[i1].coords - p0.coords;
         let v2 = points[i2].coords - p0.coords;
@@ -1048,7 +1095,19 @@ fn ransac_plane_inliers(
             best_plane = Some((normal, d));
             best_inlier_count = inlier_count;
             best_squared_error = squared_error;
+            required_iterations = required_iterations.min(adaptive_ransac_iteration_limit(
+                best_inlier_count,
+                points.len(),
+                confidence,
+                min_iterations,
+                iterations,
+            ));
         }
+    }
+
+    if required_iterations < iterations && outcome.draws >= required_iterations {
+        outcome.adaptive_stopped = true;
+        outcome.iterations_saved = iterations - outcome.draws;
     }
 
     let Some((best_normal, best_d)) = best_plane else {
@@ -1061,6 +1120,41 @@ fn ransac_plane_inliers(
     }));
     outcome.found = !inliers.is_empty();
     outcome
+}
+
+fn adaptive_ransac_iteration_limit(
+    best_inlier_count: usize,
+    point_count: usize,
+    confidence: f64,
+    min_iterations: usize,
+    max_iterations: usize,
+) -> usize {
+    if max_iterations == 0 {
+        return 0;
+    }
+
+    let minimum = min_iterations.max(1).min(max_iterations);
+    if best_inlier_count == 0
+        || point_count == 0
+        || !confidence.is_finite()
+        || !(0.0..1.0).contains(&confidence)
+    {
+        return max_iterations;
+    }
+
+    let inlier_ratio = (best_inlier_count.min(point_count) as f64) / point_count as f64;
+    let all_inlier_sample_probability = inlier_ratio.powi(3);
+    if all_inlier_sample_probability >= 1.0 {
+        return minimum;
+    }
+
+    // confidence <= 1 - (1 - w^3)^k を満たす最小の反復数 k を求める。
+    let required = ((1.0 - confidence).ln() / (-all_inlier_sample_probability).ln_1p()).ceil();
+    if !required.is_finite() || required <= 0.0 {
+        return max_iterations;
+    }
+
+    (required as usize).clamp(minimum, max_iterations)
 }
 
 fn sample_three_distinct_indices(random_state: &mut u64, len: usize) -> [usize; 3] {
@@ -1322,6 +1416,8 @@ mod tests {
             min_ransac_inliers: 8,
             min_center_observed_frames: 2,
             ransac_iterations: 64,
+            ransac_confidence: 0.999,
+            ransac_min_iterations: 8,
             ransac_inlier_distance_m: 0.025,
             min_inlier_ratio: 0.50,
             min_planarity: 0.20,
@@ -1450,26 +1546,8 @@ mod tests {
         };
         let mut first = Vec::new();
         let mut second = Vec::new();
-        let mut first_samples = FxHashSet::default();
-        let mut second_samples = FxHashSet::default();
-        assert!(ransac_plane_inliers(
-            &points,
-            center_key,
-            64,
-            0.025,
-            &mut first,
-            &mut first_samples,
-        )
-        .found);
-        assert!(ransac_plane_inliers(
-            &points,
-            center_key,
-            64,
-            0.025,
-            &mut second,
-            &mut second_samples,
-        )
-        .found);
+        assert!(ransac_plane_inliers(&points, center_key, 64, 8, 0.999, 0.025, &mut first,).found);
+        assert!(ransac_plane_inliers(&points, center_key, 64, 8, 0.999, 0.025, &mut second,).found);
 
         assert_eq!(first, second);
         assert_eq!(first.len(), 25);
@@ -1477,7 +1555,16 @@ mod tests {
     }
 
     #[test]
-    fn ransac_skips_duplicate_triplets_and_prunes_losing_hypotheses() {
+    fn adaptive_ransac_limit_uses_best_inlier_ratio() {
+        assert_eq!(adaptive_ransac_iteration_limit(50, 100, 0.999, 8, 48), 48);
+        assert_eq!(adaptive_ransac_iteration_limit(60, 100, 0.999, 8, 48), 29);
+        assert_eq!(adaptive_ransac_iteration_limit(70, 100, 0.999, 8, 48), 17);
+        assert_eq!(adaptive_ransac_iteration_limit(80, 100, 0.999, 8, 48), 10);
+        assert_eq!(adaptive_ransac_iteration_limit(90, 100, 0.999, 8, 48), 8);
+    }
+
+    #[test]
+    fn ransac_prunes_losing_hypotheses() {
         let points = [
             Point3::new(0.0, 0.0, 0.0),
             Point3::new(1.0, 0.0, 0.0),
@@ -1491,22 +1578,15 @@ mod tests {
             iz: 11,
         };
         let mut inliers = Vec::new();
-        let mut sampled_triplets = FxHashSet::default();
 
-        let outcome = ransac_plane_inliers(
-            &points,
-            center_key,
-            64,
-            0.01,
-            &mut inliers,
-            &mut sampled_triplets,
-        );
+        let outcome = ransac_plane_inliers(&points, center_key, 64, 8, 0.999, 0.01, &mut inliers);
 
         assert!(outcome.found);
-        assert!(outcome.duplicate_hypotheses > 0);
         assert!(outcome.pruned_hypotheses > 0);
         assert!(outcome.point_tests > 0);
         assert!(outcome.point_tests_skipped > 0);
+        assert!(outcome.adaptive_stopped);
+        assert!(outcome.iterations_saved > 0);
     }
 
     #[test]
