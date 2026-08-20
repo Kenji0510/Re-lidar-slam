@@ -550,25 +550,33 @@ impl LOCALMap {
         let total_start = profile_enabled.then(Instant::now);
         let candidate_generation_start = profile_enabled.then(Instant::now);
         let radius = filter_config.neighbor_radius_voxels.max(0);
-        let mut center_keys = FxHashSet::default();
+        let center_keys = {
+            let voxel_map = &self.voxel_map;
 
-        // dirty voxel は、周囲 radius 内の各中心ボクセルの平面推定に影響する。
-        for dirty_key in dirty_keys {
-            for dz in -radius..=radius {
-                for dy in -radius..=radius {
-                    for dx in -radius..=radius {
-                        let center_key = VoxelKey {
-                            ix: dirty_key.ix + dx,
-                            iy: dirty_key.iy + dy,
-                            iz: dirty_key.iz + dz,
-                        };
-                        if self.voxel_map.contains_key(&center_key) {
-                            center_keys.insert(center_key);
+            // dirty voxel は、周囲 radius 内の各中心ボクセルの平面推定に影響する。
+            // ワーカごとの Set で重複を除去してから統合し、共有 Set のロック競合を避ける。
+            dirty_keys
+                .par_iter()
+                .fold(FxHashSet::default, |mut local_center_keys, dirty_key| {
+                    for dz in -radius..=radius {
+                        for dy in -radius..=radius {
+                            for dx in -radius..=radius {
+                                let center_key = VoxelKey {
+                                    ix: dirty_key.ix + dx,
+                                    iy: dirty_key.iy + dy,
+                                    iz: dirty_key.iz + dz,
+                                };
+                                if voxel_map.contains_key(&center_key) {
+                                    local_center_keys.insert(center_key);
+                                }
+                            }
                         }
                     }
-                }
-            }
-        }
+
+                    local_center_keys
+                })
+                .reduce(FxHashSet::default, merge_voxel_key_sets)
+        };
 
         let candidate_generation_wall = candidate_generation_start
             .map(|start| start.elapsed())
@@ -592,6 +600,8 @@ impl LOCALMap {
                  parallel_evaluation_wall_ms={:.3}, neighborhood_cpu_sum_ms={:.3}, \
                  ransac_cpu_sum_ms={:.3}, pca_cpu_sum_ms={:.3}, \
                  evaluation_other_cpu_sum_ms={:.3}, result_apply_wall_ms={:.3}, \
+                 ransac_draws={}, ransac_duplicate_skips={}, ransac_pruned={}, \
+                 ransac_point_tests={}, ransac_point_tests_skipped={}, \
                  total_wall_ms={:.3}",
                 dirty_keys.len(),
                 candidate_probes,
@@ -604,6 +614,11 @@ impl LOCALMap {
                 duration_ms(timings.pca_cpu_sum),
                 duration_ms(timings.evaluation_other_cpu_sum),
                 duration_ms(timings.result_apply_wall),
+                timings.ransac_draws,
+                timings.ransac_duplicate_skips,
+                timings.ransac_pruned,
+                timings.ransac_point_tests,
+                timings.ransac_point_tests_skipped,
                 duration_ms(total_wall),
             );
         }
@@ -628,7 +643,12 @@ impl LOCALMap {
             center_keys
                 .par_iter()
                 .map_init(
-                    || SurfaceEvaluationScratch::with_capacity(max_neighbor_points),
+                    || {
+                        SurfaceEvaluationScratch::with_capacity(
+                            max_neighbor_points,
+                            filter_config.ransac_iterations,
+                        )
+                    },
                     |scratch, key| {
                         evaluate_surface_voxel(
                             voxel_map,
@@ -684,9 +704,26 @@ impl LOCALMap {
                 pca_cpu_sum: evaluation_cpu_sums.pca,
                 evaluation_other_cpu_sum: evaluation_cpu_sums.other(),
                 result_apply_wall,
+                ransac_draws: evaluation_cpu_sums.ransac_draws,
+                ransac_duplicate_skips: evaluation_cpu_sums.ransac_duplicate_skips,
+                ransac_pruned: evaluation_cpu_sums.ransac_pruned,
+                ransac_point_tests: evaluation_cpu_sums.ransac_point_tests,
+                ransac_point_tests_skipped: evaluation_cpu_sums.ransac_point_tests_skipped,
             },
         )
     }
+}
+
+fn merge_voxel_key_sets(
+    mut left: FxHashSet<VoxelKey>,
+    mut right: FxHashSet<VoxelKey>,
+) -> FxHashSet<VoxelKey> {
+    // 小さい Set を大きい Set へ追加し、再ハッシュと挿入回数を抑える。
+    if left.len() < right.len() {
+        std::mem::swap(&mut left, &mut right);
+    }
+    left.extend(right);
+    left
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -702,6 +739,11 @@ struct SurfaceEvaluationTimings {
     neighborhood: Duration,
     ransac: Duration,
     pca: Duration,
+    ransac_draws: usize,
+    ransac_duplicate_skips: usize,
+    ransac_pruned: usize,
+    ransac_point_tests: usize,
+    ransac_point_tests_skipped: usize,
 }
 
 impl SurfaceEvaluationTimings {
@@ -710,6 +752,11 @@ impl SurfaceEvaluationTimings {
         self.neighborhood += other.neighborhood;
         self.ransac += other.ransac;
         self.pca += other.pca;
+        self.ransac_draws += other.ransac_draws;
+        self.ransac_duplicate_skips += other.ransac_duplicate_skips;
+        self.ransac_pruned += other.ransac_pruned;
+        self.ransac_point_tests += other.ransac_point_tests;
+        self.ransac_point_tests_skipped += other.ransac_point_tests_skipped;
     }
 
     fn other(self) -> Duration {
@@ -728,18 +775,27 @@ struct SurfaceClassificationTimings {
     pca_cpu_sum: Duration,
     evaluation_other_cpu_sum: Duration,
     result_apply_wall: Duration,
+    ransac_draws: usize,
+    ransac_duplicate_skips: usize,
+    ransac_pruned: usize,
+    ransac_point_tests: usize,
+    ransac_point_tests_skipped: usize,
 }
 
 struct SurfaceEvaluationScratch {
     neighbor_points: Vec<Point3<f32>>,
     inlier_points: Vec<Point3<f32>>,
+    sampled_triplets: FxHashSet<[usize; 3]>,
 }
 
 impl SurfaceEvaluationScratch {
-    fn with_capacity(max_neighbor_points: usize) -> Self {
+    fn with_capacity(max_neighbor_points: usize, max_ransac_iterations: usize) -> Self {
+        let mut sampled_triplets = FxHashSet::default();
+        sampled_triplets.reserve(max_ransac_iterations);
         Self {
             neighbor_points: Vec::with_capacity(max_neighbor_points),
             inlier_points: Vec::with_capacity(max_neighbor_points),
+            sampled_triplets,
         }
     }
 }
@@ -794,17 +850,23 @@ fn evaluate_surface_voxel(
     }
 
     let ransac_start = profile_enabled.then(Instant::now);
-    let ransac_succeeded = ransac_plane_inliers(
+    let ransac_outcome = ransac_plane_inliers(
         &scratch.neighbor_points,
         center_key,
         config.ransac_iterations,
         config.ransac_inlier_distance_m,
         &mut scratch.inlier_points,
+        &mut scratch.sampled_triplets,
     );
     timings.ransac = ransac_start
         .map(|start| start.elapsed())
         .unwrap_or_default();
-    if !ransac_succeeded {
+    timings.ransac_draws = ransac_outcome.draws;
+    timings.ransac_duplicate_skips = ransac_outcome.duplicate_hypotheses;
+    timings.ransac_pruned = ransac_outcome.pruned_hypotheses;
+    timings.ransac_point_tests = ransac_outcome.point_tests;
+    timings.ransac_point_tests_skipped = ransac_outcome.point_tests_skipped;
+    if !ransac_outcome.found {
         return Some(SurfaceEvaluation {
             status: SurfaceStatus::NonPlanar,
             plane: None,
@@ -883,6 +945,16 @@ fn duration_ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct RansacOutcome {
+    found: bool,
+    draws: usize,
+    duplicate_hypotheses: usize,
+    pruned_hypotheses: usize,
+    point_tests: usize,
+    point_tests_skipped: usize,
+}
+
 /// 3点仮説を決定論的にサンプリングし、最多インライアを `inliers` に格納する。
 /// 同数の場合はインライアの二乗残差和が小さい仮説を優先する。
 fn ransac_plane_inliers(
@@ -891,14 +963,16 @@ fn ransac_plane_inliers(
     iterations: usize,
     inlier_distance_m: f32,
     inliers: &mut Vec<Point3<f32>>,
-) -> bool {
+    sampled_triplets: &mut FxHashSet<[usize; 3]>,
+) -> RansacOutcome {
     inliers.clear();
+    sampled_triplets.clear();
     if points.len() < 3
         || iterations == 0
         || !inlier_distance_m.is_finite()
         || inlier_distance_m <= 0.0
     {
-        return false;
+        return RansacOutcome::default();
     }
 
     let threshold_sq = inlier_distance_m * inlier_distance_m;
@@ -906,9 +980,18 @@ fn ransac_plane_inliers(
     let mut best_plane = None;
     let mut best_inlier_count = 0;
     let mut best_squared_error = f32::INFINITY;
+    let mut outcome = RansacOutcome::default();
 
     for _ in 0..iterations {
-        let [i0, i1, i2] = sample_three_distinct_indices(&mut random_state, points.len());
+        outcome.draws += 1;
+        let mut sample = sample_three_distinct_indices(&mut random_state, points.len());
+        sample.sort_unstable();
+        if !sampled_triplets.insert(sample) {
+            outcome.duplicate_hypotheses += 1;
+            continue;
+        }
+
+        let [i0, i1, i2] = sample;
         let p0 = points[i0];
         let v1 = points[i1].coords - p0.coords;
         let v2 = points[i2].coords - p0.coords;
@@ -922,21 +1005,41 @@ fn ransac_plane_inliers(
         let d = -normal.dot(&p0.coords);
         let mut inlier_count = 0;
         let mut squared_error = 0.0;
+        let mut hypothesis_pruned = false;
 
-        for point in points {
+        for (point_index, point) in points.iter().enumerate() {
             let distance = normal.dot(&point.coords) + d;
             let distance_sq = distance * distance;
             if distance_sq <= threshold_sq {
                 inlier_count += 1;
                 squared_error += distance_sq;
             }
+
+            let remaining_points = points.len() - point_index - 1;
+            let maximum_possible_inliers = inlier_count + remaining_points;
+            let cannot_beat_best = maximum_possible_inliers < best_inlier_count
+                || (maximum_possible_inliers == best_inlier_count
+                    && squared_error >= best_squared_error);
+            if cannot_beat_best {
+                outcome.pruned_hypotheses += 1;
+                outcome.point_tests += point_index + 1;
+                outcome.point_tests_skipped += remaining_points;
+                hypothesis_pruned = true;
+                break;
+            }
         }
+
+        if hypothesis_pruned {
+            continue;
+        }
+        outcome.point_tests += points.len();
 
         // 全点がインライアなら、後続仮説で誤差が改善しても返す点集合は変わらない。
         // 後段ではこの全点から PCA 平面を再推定するため、ここで安全に打ち切れる。
         if inlier_count == points.len() {
             inliers.extend_from_slice(points);
-            return true;
+            outcome.found = true;
+            return outcome;
         }
 
         if inlier_count > best_inlier_count
@@ -949,14 +1052,15 @@ fn ransac_plane_inliers(
     }
 
     let Some((best_normal, best_d)) = best_plane else {
-        return false;
+        return outcome;
     };
 
     inliers.extend(points.iter().copied().filter(|point| {
         let distance = best_normal.dot(&point.coords) + best_d;
         distance * distance <= threshold_sq
     }));
-    !inliers.is_empty()
+    outcome.found = !inliers.is_empty();
+    outcome
 }
 
 fn sample_three_distinct_indices(random_state: &mut u64, len: usize) -> [usize; 3] {
@@ -1346,20 +1450,63 @@ mod tests {
         };
         let mut first = Vec::new();
         let mut second = Vec::new();
+        let mut first_samples = FxHashSet::default();
+        let mut second_samples = FxHashSet::default();
         assert!(ransac_plane_inliers(
-            &points, center_key, 64, 0.025, &mut first,
-        ));
+            &points,
+            center_key,
+            64,
+            0.025,
+            &mut first,
+            &mut first_samples,
+        )
+        .found);
         assert!(ransac_plane_inliers(
             &points,
             center_key,
             64,
             0.025,
             &mut second,
-        ));
+            &mut second_samples,
+        )
+        .found);
 
         assert_eq!(first, second);
         assert_eq!(first.len(), 25);
         assert!(first.iter().all(|point| point.z == 0.0));
+    }
+
+    #[test]
+    fn ransac_skips_duplicate_triplets_and_prunes_losing_hypotheses() {
+        let points = [
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+            Point3::new(0.0, 0.0, 1.0),
+            Point3::new(1.0, 1.0, 1.0),
+        ];
+        let center_key = VoxelKey {
+            ix: 7,
+            iy: -3,
+            iz: 11,
+        };
+        let mut inliers = Vec::new();
+        let mut sampled_triplets = FxHashSet::default();
+
+        let outcome = ransac_plane_inliers(
+            &points,
+            center_key,
+            64,
+            0.01,
+            &mut inliers,
+            &mut sampled_triplets,
+        );
+
+        assert!(outcome.found);
+        assert!(outcome.duplicate_hypotheses > 0);
+        assert!(outcome.pruned_hypotheses > 0);
+        assert!(outcome.point_tests > 0);
+        assert!(outcome.point_tests_skipped > 0);
     }
 
     #[test]
