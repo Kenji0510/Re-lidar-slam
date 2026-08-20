@@ -572,14 +572,23 @@ impl LOCALMap {
         center_keys: &[VoxelKey],
         filter_config: &SurfaceFilterConfig,
     ) -> SurfaceClassificationStats {
+        let radius = filter_config.neighbor_radius_voxels.max(0) as usize;
+        let neighborhood_width = radius * 2 + 1;
+        let max_neighbor_points = neighborhood_width
+            .saturating_mul(neighborhood_width)
+            .saturating_mul(neighborhood_width);
         let evaluations: Vec<(VoxelKey, SurfaceEvaluation)> = {
             let voxel_map = &self.voxel_map;
             center_keys
                 .par_iter()
-                .filter_map(|key| {
-                    evaluate_surface_voxel(voxel_map, *key, filter_config)
-                        .map(|evaluation| (*key, evaluation))
-                })
+                .map_init(
+                    || SurfaceEvaluationScratch::with_capacity(max_neighbor_points),
+                    |scratch, key| {
+                        evaluate_surface_voxel(voxel_map, *key, filter_config, scratch)
+                            .map(|evaluation| (*key, evaluation))
+                    },
+                )
+                .filter_map(|evaluation| evaluation)
                 .collect()
         };
 
@@ -609,11 +618,29 @@ struct SurfaceEvaluation {
     plane: Option<SurfacePlane>,
 }
 
+struct SurfaceEvaluationScratch {
+    neighbor_points: Vec<Point3<f32>>,
+    inlier_points: Vec<Point3<f32>>,
+}
+
+impl SurfaceEvaluationScratch {
+    fn with_capacity(max_neighbor_points: usize) -> Self {
+        Self {
+            neighbor_points: Vec::with_capacity(max_neighbor_points),
+            inlier_points: Vec::with_capacity(max_neighbor_points),
+        }
+    }
+}
+
 fn evaluate_surface_voxel(
     voxel_map: &VoxelMap,
     center_key: VoxelKey,
     config: &SurfaceFilterConfig,
+    scratch: &mut SurfaceEvaluationScratch,
 ) -> Option<SurfaceEvaluation> {
+    scratch.neighbor_points.clear();
+    scratch.inlier_points.clear();
+
     let center_cell = voxel_map.get(&center_key)?;
     if center_cell.observed_frames < config.min_center_observed_frames {
         return Some(SurfaceEvaluation {
@@ -623,7 +650,6 @@ fn evaluate_surface_voxel(
     }
 
     let radius = config.neighbor_radius_voxels.max(0);
-    let mut neighbor_points = Vec::new();
     for dz in -radius..=radius {
         for dy in -radius..=radius {
             for dx in -radius..=radius {
@@ -633,33 +659,36 @@ fn evaluate_surface_voxel(
                     iz: center_key.iz + dz,
                 };
                 if let Some(cell) = voxel_map.get(&key) {
-                    neighbor_points.push(cell.mean);
+                    scratch.neighbor_points.push(cell.mean);
                 }
             }
         }
     }
 
-    if neighbor_points.len() < config.min_neighbors {
+    if scratch.neighbor_points.len() < config.min_neighbors {
         return Some(SurfaceEvaluation {
             status: SurfaceStatus::Unknown,
             plane: None,
         });
     }
 
-    let Some(inliers) = ransac_plane_inliers(
-        &neighbor_points,
+    if !ransac_plane_inliers(
+        &scratch.neighbor_points,
         center_key,
         config.ransac_iterations,
         config.ransac_inlier_distance_m,
-    ) else {
+        &mut scratch.inlier_points,
+    ) {
         return Some(SurfaceEvaluation {
             status: SurfaceStatus::NonPlanar,
             plane: None,
         });
-    };
+    }
 
-    let inlier_ratio = inliers.len() as f32 / neighbor_points.len() as f32;
-    if inliers.len() < config.min_ransac_inliers || inlier_ratio < config.min_inlier_ratio {
+    let inlier_ratio = scratch.inlier_points.len() as f32 / scratch.neighbor_points.len() as f32;
+    if scratch.inlier_points.len() < config.min_ransac_inliers
+        || inlier_ratio < config.min_inlier_ratio
+    {
         return Some(SurfaceEvaluation {
             status: SurfaceStatus::NonPlanar,
             plane: None,
@@ -667,18 +696,19 @@ fn evaluate_surface_voxel(
     }
 
     // RANSAC で外れ値を除去した後の PCA は、この1回だけ実施する。
-    let Some(fitted_plane) = fit_plane(&inliers) else {
+    let Some(fitted_plane) = fit_plane(&scratch.inlier_points) else {
         return Some(SurfaceEvaluation {
             status: SurfaceStatus::NonPlanar,
             plane: None,
         });
     };
 
-    let rmse_m = (inliers
+    let rmse_m = (scratch
+        .inlier_points
         .iter()
         .map(|point| (fitted_plane.normal.dot(&point.coords) + fitted_plane.d).powi(2))
         .sum::<f32>()
-        / inliers.len() as f32)
+        / scratch.inlier_points.len() as f32)
         .sqrt();
     let center_distance =
         (fitted_plane.normal.dot(&center_cell.mean.coords) + fitted_plane.d).abs();
@@ -692,8 +722,8 @@ fn evaluate_surface_voxel(
         normal: fitted_plane.normal,
         d: fitted_plane.d,
         rmse_m,
-        neighbor_count: neighbor_points.len(),
-        inlier_count: inliers.len(),
+        neighbor_count: scratch.neighbor_points.len(),
+        inlier_count: scratch.inlier_points.len(),
     });
 
     Some(SurfaceEvaluation {
@@ -706,25 +736,28 @@ fn evaluate_surface_voxel(
     })
 }
 
-/// 3点仮説を決定論的にサンプリングし、最多インライアの集合を返す。
+/// 3点仮説を決定論的にサンプリングし、最多インライアを `inliers` に格納する。
 /// 同数の場合はインライアの二乗残差和が小さい仮説を優先する。
 fn ransac_plane_inliers(
     points: &[Point3<f32>],
     center_key: VoxelKey,
     iterations: usize,
     inlier_distance_m: f32,
-) -> Option<Vec<Point3<f32>>> {
+    inliers: &mut Vec<Point3<f32>>,
+) -> bool {
+    inliers.clear();
     if points.len() < 3
         || iterations == 0
         || !inlier_distance_m.is_finite()
         || inlier_distance_m <= 0.0
     {
-        return None;
+        return false;
     }
 
     let threshold_sq = inlier_distance_m * inlier_distance_m;
     let mut random_state = ransac_seed(center_key);
-    let mut best_indices = Vec::new();
+    let mut best_plane = None;
+    let mut best_inlier_count = 0;
     let mut best_squared_error = f32::INFINITY;
 
     for _ in 0..iterations {
@@ -740,32 +773,43 @@ fn ransac_plane_inliers(
 
         let normal = normal / normal_norm;
         let d = -normal.dot(&p0.coords);
-        let mut indices = Vec::new();
+        let mut inlier_count = 0;
         let mut squared_error = 0.0;
 
-        for (index, point) in points.iter().enumerate() {
+        for point in points {
             let distance = normal.dot(&point.coords) + d;
             let distance_sq = distance * distance;
             if distance_sq <= threshold_sq {
-                indices.push(index);
+                inlier_count += 1;
                 squared_error += distance_sq;
             }
         }
 
-        if indices.len() > best_indices.len()
-            || (indices.len() == best_indices.len() && squared_error < best_squared_error)
+        // 全点がインライアなら、後続仮説で誤差が改善しても返す点集合は変わらない。
+        // 後段ではこの全点から PCA 平面を再推定するため、ここで安全に打ち切れる。
+        if inlier_count == points.len() {
+            inliers.extend_from_slice(points);
+            return true;
+        }
+
+        if inlier_count > best_inlier_count
+            || (inlier_count == best_inlier_count && squared_error < best_squared_error)
         {
-            best_indices = indices;
+            best_plane = Some((normal, d));
+            best_inlier_count = inlier_count;
             best_squared_error = squared_error;
         }
     }
 
-    (!best_indices.is_empty()).then(|| {
-        best_indices
-            .into_iter()
-            .map(|index| points[index])
-            .collect()
-    })
+    let Some((best_normal, best_d)) = best_plane else {
+        return false;
+    };
+
+    inliers.extend(points.iter().copied().filter(|point| {
+        let distance = best_normal.dot(&point.coords) + best_d;
+        distance * distance <= threshold_sq
+    }));
+    !inliers.is_empty()
 }
 
 fn sample_three_distinct_indices(random_state: &mut u64, len: usize) -> [usize; 3] {
@@ -1153,8 +1197,18 @@ mod tests {
             iy: 0,
             iz: 0,
         };
-        let first = ransac_plane_inliers(&points, center_key, 64, 0.025).unwrap();
-        let second = ransac_plane_inliers(&points, center_key, 64, 0.025).unwrap();
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        assert!(ransac_plane_inliers(
+            &points, center_key, 64, 0.025, &mut first,
+        ));
+        assert!(ransac_plane_inliers(
+            &points,
+            center_key,
+            64,
+            0.025,
+            &mut second,
+        ));
 
         assert_eq!(first, second);
         assert_eq!(first.len(), 25);

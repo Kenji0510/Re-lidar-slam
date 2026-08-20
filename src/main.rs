@@ -18,7 +18,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const DATASET_DIR: &str = "/mnt/nas/share/airy96/08152026/pcd/08012026-airy96-01";
+const DATASET_DIR: &str = "data/input/08082026/08012026-airy96-mid70-07";
 const SAVE_ROOT_DIR: &str = "data/output/debug/08152026";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,7 +150,7 @@ const SURFACE_NEIGHBOR_RADIUS_VOXELS: i32 = 2;
 const SURFACE_MIN_NEIGHBORS: usize = 10;
 const SURFACE_MIN_RANSAC_INLIERS: usize = 8;
 const SURFACE_MIN_CENTER_OBSERVED_FRAMES: u64 = 2;
-const SURFACE_RANSAC_ITERATIONS: usize = 64;
+const SURFACE_RANSAC_ITERATIONS: usize = 48;
 const SURFACE_RANSAC_INLIER_DISTANCE_M: f32 = 0.025;
 const SURFACE_MIN_INLIER_RATIO: f32 = 0.50;
 const SURFACE_MIN_PLANARITY: f32 = 0.20;
