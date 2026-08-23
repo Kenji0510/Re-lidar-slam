@@ -4,7 +4,10 @@ use re_lidar_slam::{
     deskew_points::deskew_points,
     file_handler::{load_imu_data, load_pcd_files, load_pcd_xyzit, save_pcd_xyz},
     find_nearest_points::pickup_valid_source_points,
-    icp::{apply_delta, build_point_to_plane_system, compute_rmse, solve_icp_delta},
+    icp::{
+        apply_delta, build_robust_point_to_plane_system, compute_rmse, compute_robust_cost,
+        solve_icp_delta_observable,
+    },
     predict_pose_by_imu::{align_imu_timestamps, build_rotation_trajectory, predict_pose_by_imu},
     types::{CurrentFrameInfo, FrameLog, IMU, PointXYZ, SLAMMap},
     voxel_map::{
@@ -18,7 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const DATASET_DIR: &str = "/mnt/nas/share/avia/08222026/pcds/08222026-avia-10";
+const DATASET_DIR: &str = "/mnt/nas/share/avia/08222026/pcds/08222026-avia-11";
 const SAVE_ROOT_DIR: &str = "data/output/debug/08222026";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,8 +179,22 @@ const WORLD_UPDATE_PENDING_DISTANCE_M: f32 = 0.10;
 const WORLD_UPDATE_PENDING_MAX_AGE_FRAMES: u64 = 30;
 
 const ICP_ITERATIONS: usize = 8;
-const ICP_RMSE_THRESHOLD: f32 = 0.10; // Absolute point-to-plane RMSE convergence threshold [m]
-const ICP_RMSE_DIVERGE_THRESHOLD: f32 = 1.0; // Reject ICP and fall back to IMU prediction [m]
+const ICP_HUBER_DELTA_M: f32 = 0.08;
+const ICP_MIN_CORRESPONDENCES: usize = 100;
+const ICP_MIN_CORRESPONDENCE_RATIO: f32 = 0.05;
+const ICP_MIN_OBSERVABLE_RANK: usize = 3;
+const ICP_RELATIVE_EIGENVALUE_THRESHOLD: f32 = 0.02;
+const ICP_DAMPING: f32 = 1e-6;
+const ICP_MAX_FINAL_RMSE_M: f32 = 0.15;
+// Limits apply to the ICP correction relative to the IMU prediction, not to
+// the vehicle's total frame-to-frame motion.
+const ICP_MAX_TRANSLATION_CORRECTION_M: f32 = 0.10;
+const ICP_MAX_ROTATION_CORRECTION_DEG: f32 = 2.0;
+const ICP_RMSE_CHANGE_THRESHOLD_M: f32 = 1e-4;
+const ICP_TRANSLATION_DELTA_THRESHOLD_M: f32 = 0.001;
+const ICP_ROTATION_DELTA_THRESHOLD_DEG: f32 = 0.01;
+const LOCAL_SOURCE_TO_PLANE_MAX_DISTANCE_M: f32 = 0.15;
+const LOCAL_MIN_PLANARITY: f32 = 0.10;
 const MIN_IMU_SAMPLES_PER_POINT_CLOUD_FRAME: usize = 5;
 
 const MAX_DIST_FOR_VOXEL_MAP: f32 = 150.0;
@@ -400,15 +417,26 @@ fn main() -> Result<()> {
         // --- ICP (Point to Plane) ---
         // IMU 予測姿勢を初期値として (R, t) を取り出す
         let pred_pose = pose_prediction.0.cast::<f32>();
-        let mut r_mat: Matrix3<f32> = pred_pose.fixed_view::<3, 3>(0, 0).into();
-        let mut t_vec: Vector3<f32> = pred_pose.fixed_view::<3, 1>(0, 3).into();
+        let pred_r: Matrix3<f32> = pred_pose.fixed_view::<3, 3>(0, 0).into();
+        let pred_t: Vector3<f32> = pred_pose.fixed_view::<3, 1>(0, 3).into();
+        let mut r_mat = pred_r;
+        let mut t_vec = pred_t;
 
-        let mut prev_rmse = f32::INFINITY;
+        let local_map_was_empty = slam_map.local_voxel_map.voxel_map.is_empty();
+        let source_point_count = source_voxel_map.len();
+        let min_correspondences = ICP_MIN_CORRESPONDENCES
+            .max((source_point_count as f32 * ICP_MIN_CORRESPONDENCE_RATIO).ceil() as usize);
+        let mut previous_rmse: Option<f32> = None;
+        let mut final_rmse: Option<f32> = None;
+        let mut final_correspondence_count = 0usize;
+        let mut final_correspondence_ratio = 0.0f32;
+        let mut final_observable_rank = 0usize;
+        let mut final_eigenvalue_ratio: Option<f32> = None;
         let mut icp_ok = false; // ICP が有効な解を得られたか
 
         let loop_start = Instant::now();
 
-        if slam_map.local_voxel_map.voxel_map.is_empty() {
+        if local_map_was_empty {
             log::debug!("Frame {i}: local map empty, skipping ICP");
         } else {
             for _iter in 0..ICP_ITERATIONS {
@@ -424,33 +452,95 @@ fn main() -> Result<()> {
                     MAX_DIST_FACTOR,
                     LOCAL_PLANE_POINT_DISTANCE_THRESHOLD_M,
                     LOCAL_SOURCE_PLANE_SCORE_THRESHOLD,
-                    None,
-                    None,
+                    Some(LOCAL_SOURCE_TO_PLANE_MAX_DISTANCE_M),
+                    Some(LOCAL_MIN_PLANARITY),
                     &r_mat,
                     &t_vec,
                 );
+                let correspondence_ratio = if source_point_count > 0 {
+                    correspondences.len() as f32 / source_point_count as f32
+                } else {
+                    0.0
+                };
                 let pickup_end = pickup_start.elapsed();
                 log::debug!(
-                    "ICP iter {_iter}: Picked up {} correspondences in {:.2?}",
+                    "ICP iter {_iter}: Picked up {} correspondences ({:.1}%) in {:.2?}",
                     correspondences.len(),
+                    correspondence_ratio * 100.0,
                     pickup_end
                 );
 
+                if correspondences.len() < min_correspondences {
+                    log::warn!(
+                        "ICP iter {_iter}: insufficient correspondences: {} < {}",
+                        correspondences.len(),
+                        min_correspondences,
+                    );
+                    break;
+                }
+
                 // 線形システム構築
                 let system_start = Instant::now();
-                let system = build_point_to_plane_system(&correspondences, &r_mat, &t_vec);
+                let system = build_robust_point_to_plane_system(
+                    &correspondences,
+                    &r_mat,
+                    &t_vec,
+                    ICP_HUBER_DELTA_M,
+                );
 
-                // 解く → pose 更新
-                match solve_icp_delta(&system, 1e-6) {
-                    Some(delta) => {
-                        (r_mat, t_vec) = apply_delta(&r_mat, &t_vec, &delta);
-                        icp_ok = true;
-                    }
-                    None => {
-                        log::warn!("ICP iter {_iter}: solve failed (too few correspondences)");
-                        break;
-                    }
+                let Some(solve_result) = solve_icp_delta_observable(
+                    &system,
+                    ICP_DAMPING,
+                    ICP_RELATIVE_EIGENVALUE_THRESHOLD,
+                ) else {
+                    log::warn!("ICP iter {_iter}: observable solve failed");
+                    break;
+                };
+                if solve_result.observable_rank < ICP_MIN_OBSERVABLE_RANK {
+                    log::warn!(
+                        "ICP iter {_iter}: degenerate geometry (observable rank {} < {})",
+                        solve_result.observable_rank,
+                        ICP_MIN_OBSERVABLE_RANK,
+                    );
+                    break;
                 }
+
+                let delta_translation_m = solve_result.delta.fixed_rows::<3>(3).norm();
+                let delta_rotation_deg = solve_result.delta.fixed_rows::<3>(0).norm().to_degrees();
+                let (candidate_r, candidate_t) = apply_delta(&r_mat, &t_vec, &solve_result.delta);
+                let (total_translation_correction_m, total_rotation_correction_deg) =
+                    pose_correction_magnitudes(&pred_r, &pred_t, &candidate_r, &candidate_t);
+
+                if total_translation_correction_m > ICP_MAX_TRANSLATION_CORRECTION_M
+                    || total_rotation_correction_deg > ICP_MAX_ROTATION_CORRECTION_DEG
+                {
+                    log::warn!(
+                        "ICP iter {_iter}: correction exceeds prediction gate: \
+                         translation={total_translation_correction_m:.4} m, \
+                         rotation={total_rotation_correction_deg:.3} deg",
+                    );
+                    break;
+                }
+
+                let candidate_cost = compute_robust_cost(
+                    &correspondences,
+                    &candidate_r,
+                    &candidate_t,
+                    ICP_HUBER_DELTA_M,
+                );
+                if !candidate_cost.is_finite() || candidate_cost > system.cost * (1.0 + 1e-5) + 1e-8
+                {
+                    log::warn!(
+                        "ICP iter {_iter}: robust cost did not improve ({:.6} -> {:.6})",
+                        system.cost,
+                        candidate_cost,
+                    );
+                    break;
+                }
+
+                r_mat = candidate_r;
+                t_vec = candidate_t;
+                icp_ok = true;
                 let system_end = system_start.elapsed();
                 log::debug!(
                     "ICP iter {_iter}: Built point-to-plane system in {:.2?}",
@@ -459,44 +549,109 @@ fn main() -> Result<()> {
 
                 // RMSE を計算して収束チェック
                 let rmse = compute_rmse(&correspondences, &r_mat, &t_vec);
+                final_rmse = Some(rmse);
+                final_correspondence_count = correspondences.len();
+                final_correspondence_ratio = correspondence_ratio;
+                final_observable_rank = solve_result.observable_rank;
+                final_eigenvalue_ratio = Some(solve_result.min_observable_eigenvalue_ratio);
                 log::debug!(
-                    "ICP iter {_iter}: used={}, cost={:.6}, rmse={:.6}",
+                    "ICP iter {_iter}: used={}, robust_cost={:.6}->{:.6}, rmse={:.6}, \
+                     rank={}, min_eigen_ratio={:.3e}, delta_t={:.4} m, delta_r={:.3} deg",
                     system.used_count,
                     system.cost,
-                    rmse
+                    candidate_cost,
+                    rmse,
+                    solve_result.observable_rank,
+                    solve_result.min_observable_eigenvalue_ratio,
+                    delta_translation_m,
+                    delta_rotation_deg,
                 );
 
-                // RMSE が発散した場合は ICP 結果を棄却して IMU 予測に戻す
-                if rmse > ICP_RMSE_DIVERGE_THRESHOLD {
-                    log::warn!(
-                        "ICP iter {_iter}: RMSE diverged ({rmse:.4}), reverting to IMU prediction"
+                let rmse_converged = previous_rmse
+                    .is_some_and(|previous| (previous - rmse).abs() < ICP_RMSE_CHANGE_THRESHOLD_M);
+                previous_rmse = Some(rmse);
+                if rmse_converged
+                    && delta_translation_m < ICP_TRANSLATION_DELTA_THRESHOLD_M
+                    && delta_rotation_deg < ICP_ROTATION_DELTA_THRESHOLD_DEG
+                {
+                    log::debug!(
+                        "ICP converged at iter {_iter}: delta_t={delta_translation_m:.3e} m, \
+                         delta_r={delta_rotation_deg:.3e} deg",
                     );
-                    r_mat = pred_pose.fixed_view::<3, 3>(0, 0).into();
-                    t_vec = pred_pose.fixed_view::<3, 1>(0, 3).into();
-                    icp_ok = false;
                     break;
+                }
+            }
+
+            // Rebuild correspondences at the accepted pose so stale matches cannot
+            // make a bad final pose look valid.
+            if icp_ok {
+                let correspondences = pickup_valid_source_points::<LOCAL_KNN_K>(
+                    &source_voxel_map,
+                    &slam_map.local_voxel_map.voxel_map,
+                    slam_map.local_voxel_map.config.index_voxel_size,
+                    SEARCH_RANGE,
+                    MAX_DIST_FACTOR,
+                    LOCAL_PLANE_POINT_DISTANCE_THRESHOLD_M,
+                    LOCAL_SOURCE_PLANE_SCORE_THRESHOLD,
+                    Some(LOCAL_SOURCE_TO_PLANE_MAX_DISTANCE_M),
+                    Some(LOCAL_MIN_PLANARITY),
+                    &r_mat,
+                    &t_vec,
+                );
+                final_correspondence_count = correspondences.len();
+                final_correspondence_ratio = if source_point_count > 0 {
+                    correspondences.len() as f32 / source_point_count as f32
+                } else {
+                    0.0
+                };
+                final_rmse = Some(compute_rmse(&correspondences, &r_mat, &t_vec));
+
+                let final_system = build_robust_point_to_plane_system(
+                    &correspondences,
+                    &r_mat,
+                    &t_vec,
+                    ICP_HUBER_DELTA_M,
+                );
+                let final_solve = solve_icp_delta_observable(
+                    &final_system,
+                    ICP_DAMPING,
+                    ICP_RELATIVE_EIGENVALUE_THRESHOLD,
+                );
+                final_observable_rank = 0;
+                final_eigenvalue_ratio = None;
+                if let Some(result) = &final_solve {
+                    final_observable_rank = result.observable_rank;
+                    final_eigenvalue_ratio = Some(result.min_observable_eigenvalue_ratio);
                 }
 
-                // if (prev_rmse - rmse).abs() < ICP_RMSE_THRESHOLD {
-                if rmse < ICP_RMSE_THRESHOLD {
-                    log::debug!(
-                        "ICP converged at iter {_iter} (|Δrmse|={:.2e})",
-                        (prev_rmse - rmse).abs()
+                let final_quality_ok = final_correspondence_count >= min_correspondences
+                    && final_observable_rank >= ICP_MIN_OBSERVABLE_RANK
+                    && final_rmse
+                        .is_some_and(|rmse| rmse.is_finite() && rmse <= ICP_MAX_FINAL_RMSE_M);
+                if !final_quality_ok {
+                    log::warn!(
+                        "Frame {i}: final ICP quality rejected: correspondences={} (min {}), \
+                         rank={}, rmse={:?}",
+                        final_correspondence_count,
+                        min_correspondences,
+                        final_observable_rank,
+                        final_rmse,
                     );
-                    break;
+                    icp_ok = false;
                 }
-                prev_rmse = rmse;
             }
 
             if !icp_ok {
                 log::warn!("Frame {i}: ICP failed, using IMU prediction");
+                r_mat = pred_r;
+                t_vec = pred_t;
             }
         }
         let loop_end = loop_start.elapsed();
         log::debug!(
-            "Frame {i}: ICP loop finished in {:.2?}, final RMSE={:.6}",
+            "Frame {i}: ICP loop finished in {:.2?}, final RMSE={:?}",
             loop_end,
-            prev_rmse
+            final_rmse,
         );
         // --- ICP (Point to Plane) ---
 
@@ -520,8 +675,13 @@ fn main() -> Result<()> {
         let new_pos = new_global_pose.fixed_view::<3, 1>(0, 3).into_owned();
         let dt = (current_frame_start_time - prev_frame_start_time).max(1e-6);
         let raw_velocity = (new_pos - prev_pos) / dt;
-        // 速度が異常に大きい場合（ICP 発散など）はクランプして安定化
-        let new_velocity = raw_velocity.cap_magnitude(2.0);
+        // Rejected/degenerate ICP must not feed a position jump back into the
+        // next IMU prediction. Keep the velocity predicted by the IMU instead.
+        let new_velocity = if icp_ok {
+            raw_velocity.cap_magnitude(2.0)
+        } else {
+            pose_prediction.1
+        };
 
         current_frame_info.current_global_pose = new_global_pose;
         current_frame_info.current_velocity = new_velocity;
@@ -534,15 +694,24 @@ fn main() -> Result<()> {
             .clamp(-1.0, 1.0)
             .acos()
             .to_degrees();
+        let (icp_translation_correction_m, icp_rotation_correction_deg) = if icp_ok {
+            pose_correction_magnitudes(&pred_r, &pred_t, &r_mat, &t_vec)
+        } else {
+            (0.0, 0.0)
+        };
+        let map_update_allowed = local_map_was_empty || icp_ok;
         frame_logs.push(FrameLog {
             frame_index: i,
             timestamp: current_frame_start_time,
             icp_ok,
-            rmse: if prev_rmse.is_finite() {
-                Some(prev_rmse)
-            } else {
-                None
-            },
+            rmse: final_rmse.filter(|rmse| rmse.is_finite()),
+            correspondence_count: final_correspondence_count,
+            correspondence_ratio: final_correspondence_ratio,
+            observable_rank: final_observable_rank,
+            min_observable_eigenvalue_ratio: final_eigenvalue_ratio,
+            icp_translation_correction_m,
+            icp_rotation_correction_deg,
+            map_updated: map_update_allowed,
             translation_m,
             rotation_deg,
             velocity_m_s: new_velocity.norm(),
@@ -558,38 +727,44 @@ fn main() -> Result<()> {
         // それ以外は pickup_valid_source_points で平面に乗っている点だけ抽出し、
         // ICP 収束後の最終姿勢 (r_mat, t_vec) でワールドマップに追加する。
         let global_filter_start = Instant::now();
-        let global_source_points: Vec<Point3<f32>> =
-            if slam_map.local_voxel_map.voxel_map.is_empty() {
-                downsampled_source_points_for_global.clone()
-            } else {
-                let valid = pickup_valid_source_points::<GLOBAL_KNN_K>(
-                    &source_voxel_map_for_global,
-                    &slam_map.local_voxel_map.voxel_map,
-                    slam_map.local_voxel_map.config.index_voxel_size,
-                    SEARCH_RANGE,
-                    MAX_DIST_FACTOR,
-                    GLOBAL_PLANE_POINT_DISTANCE_THRESHOLD_M,
-                    GLOBAL_SOURCE_PLANE_SCORE_THRESHOLD,
-                    Some(GLOBAL_SOURCE_TO_PLANE_MAX_DISTANCE_M),
-                    Some(GLOBAL_MIN_PLANARITY),
-                    &r_mat,
-                    &t_vec,
-                );
-                log::debug!(
-                    "Frame {i}: {} / {} source points passed plane filter for global map",
-                    valid.len(),
-                    source_voxel_map_for_global.len(),
-                );
-                valid.into_iter().map(|c| c.src_point).collect()
-            };
+        let global_source_points: Vec<Point3<f32>> = if !map_update_allowed {
+            log::warn!("Frame {i}: map update skipped because ICP quality is insufficient");
+            Vec::new()
+        } else if local_map_was_empty {
+            downsampled_source_points_for_global.clone()
+        } else {
+            let valid = pickup_valid_source_points::<GLOBAL_KNN_K>(
+                &source_voxel_map_for_global,
+                &slam_map.local_voxel_map.voxel_map,
+                slam_map.local_voxel_map.config.index_voxel_size,
+                SEARCH_RANGE,
+                MAX_DIST_FACTOR,
+                GLOBAL_PLANE_POINT_DISTANCE_THRESHOLD_M,
+                GLOBAL_SOURCE_PLANE_SCORE_THRESHOLD,
+                Some(GLOBAL_SOURCE_TO_PLANE_MAX_DISTANCE_M),
+                Some(GLOBAL_MIN_PLANARITY),
+                &r_mat,
+                &t_vec,
+            );
+            log::debug!(
+                "Frame {i}: {} / {} source points passed plane filter for global map",
+                valid.len(),
+                source_voxel_map_for_global.len(),
+            );
+            valid.into_iter().map(|c| c.src_point).collect()
+        };
         let global_filter_time = global_filter_start.elapsed();
 
         let global_map_update_start = Instant::now();
-        let global_update_stats = slam_map.global_voxel_map.update_world_map_filtered(
-            &global_source_points,
-            &current_frame_info.current_global_pose,
-            &world_map_update_filter_config,
-        );
+        let global_update_stats = if map_update_allowed {
+            slam_map.global_voxel_map.update_world_map_filtered(
+                &global_source_points,
+                &current_frame_info.current_global_pose,
+                &world_map_update_filter_config,
+            )
+        } else {
+            Default::default()
+        };
         let global_map_update_time = global_map_update_start.elapsed();
         log::debug!(
             "Frame {i}: GlobalMap update input={}, provisional={}, projected={}, \
@@ -623,10 +798,12 @@ fn main() -> Result<()> {
 
         // --- Update the LocalMap with the new frame's points ---
         let local_map_update_start = Instant::now();
-        slam_map.local_voxel_map.update_with_new_frame(
-            &downsampled_source_points_for_local,
-            &current_frame_info.current_global_pose,
-        );
+        if map_update_allowed {
+            slam_map.local_voxel_map.update_with_new_frame(
+                &downsampled_source_points_for_local,
+                &current_frame_info.current_global_pose,
+            );
+        }
         let local_map_update_time = local_map_update_start.elapsed();
         // --- Update the LocalMap with the new frame's points ---
 
@@ -770,6 +947,21 @@ fn main() -> Result<()> {
 #[inline]
 fn duration_ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
+}
+
+fn pose_correction_magnitudes(
+    reference_r: &Matrix3<f32>,
+    reference_t: &Vector3<f32>,
+    candidate_r: &Matrix3<f32>,
+    candidate_t: &Vector3<f32>,
+) -> (f32, f32) {
+    let translation_m = (candidate_t - reference_t).norm();
+    let delta_r = candidate_r * reference_r.transpose();
+    let rotation_deg = ((delta_r.trace() - 1.0) * 0.5)
+        .clamp(-1.0, 1.0)
+        .acos()
+        .to_degrees();
+    (translation_m, rotation_deg)
 }
 
 /// Mid-70座標の点をAiry-96座標へ写す外部変換 `T_airy96_from_mid70`。

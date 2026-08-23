@@ -20,6 +20,15 @@ pub struct IcpLinearSystem {
     pub used_count: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct IcpSolveResult {
+    pub delta: Vector6f,
+    /// Number of observable directions retained from the normalized Hessian.
+    pub observable_rank: usize,
+    /// Smallest retained eigenvalue divided by the largest eigenvalue.
+    pub min_observable_eigenvalue_ratio: f32,
+}
+
 impl Default for IcpLinearSystem {
     fn default() -> Self {
         Self {
@@ -39,11 +48,24 @@ impl Default for IcpLinearSystem {
 ///
 /// 残差: e = n^T * (R*p_s + t - p_t)
 /// ヤコビアン: J = [(R*p_s × n)^T,  n^T]  (1×6)
-/// H += J^T * J,  b += J^T * e
+/// H += J^T * J,  b -= J^T * e
 pub fn build_point_to_plane_system(
     correspondences: &[PointCorrespondence],
     r_mat: &Matrix3<f32>,
     t_vec: &Vector3<f32>,
+) -> IcpLinearSystem {
+    build_robust_point_to_plane_system(correspondences, r_mat, t_vec, f32::INFINITY)
+}
+
+/// Build a Point-to-Plane system with a Huber M-estimator.
+///
+/// `huber_delta_m` is the transition distance in metres. Passing infinity
+/// preserves the unweighted least-squares behaviour.
+pub fn build_robust_point_to_plane_system(
+    correspondences: &[PointCorrespondence],
+    r_mat: &Matrix3<f32>,
+    t_vec: &Vector3<f32>,
+    huber_delta_m: f32,
 ) -> IcpLinearSystem {
     type Accum = (Matrix6f, Vector6f, f32, usize);
 
@@ -55,14 +77,8 @@ pub fn build_point_to_plane_system(
                 let rp = r_mat * corr.src_point.coords;
                 let transformed = rp + t_vec;
 
-                let target_pt = if corr.target_cell.is_point {
-                    corr.target_cell.point.0
-                } else {
-                    corr.target_cell.mean
-                };
-
-                // let residual = corr.plane_normal.dot(&(transformed - target_pt.coords));
                 let residual = corr.plane_normal.dot(&transformed) + corr.plane_d;
+                let weight = huber_weight(residual, huber_delta_m);
 
                 let j_rot = rp.cross(&corr.plane_normal);
                 let j_trans = corr.plane_normal;
@@ -75,9 +91,9 @@ pub fn build_point_to_plane_system(
                 j[4] = j_trans.y;
                 j[5] = j_trans.z;
 
-                h += j * j.transpose();
-                b -= j * residual;
-                cost += residual * residual;
+                h += weight * (j * j.transpose());
+                b -= weight * j * residual;
+                cost += huber_loss(residual, huber_delta_m);
                 cnt += 1;
                 (h, b, cost, cnt)
             },
@@ -95,27 +111,141 @@ pub fn build_point_to_plane_system(
     }
 }
 
+#[inline]
+fn huber_weight(residual: f32, delta: f32) -> f32 {
+    let abs_residual = residual.abs();
+    if !delta.is_finite() || abs_residual <= delta {
+        1.0
+    } else if delta > 0.0 && abs_residual.is_finite() {
+        delta / abs_residual.max(f32::EPSILON)
+    } else {
+        0.0
+    }
+}
+
+#[inline]
+fn huber_loss(residual: f32, delta: f32) -> f32 {
+    let abs_residual = residual.abs();
+    if !delta.is_finite() || abs_residual <= delta {
+        residual * residual
+    } else if delta > 0.0 && abs_residual.is_finite() {
+        2.0 * delta * abs_residual - delta * delta
+    } else {
+        f32::INFINITY
+    }
+}
+
 /// 線形システムを解いて pose 差分 δ = [δθ; δt] を返す。
 /// 対応点が 6 未満なら None。
 pub fn solve_icp_delta(system: &IcpLinearSystem, damping: f32) -> Option<Vector6f> {
-    if system.used_count < 6 {
+    solve_icp_delta_observable(system, damping, 0.0).map(|result| result.delta)
+}
+
+/// Solve ICP in normalized Hessian coordinates and discard weak eigen-directions.
+///
+/// Rotation and translation have different units, so the rotation block is
+/// scaled by the point cloud's characteristic lever arm. Eigenvectors whose
+/// eigenvalue is less than `relative_eigenvalue_threshold * max_eigenvalue`
+/// are treated as unobservable.
+/// Because ICP starts from the motion prediction, a zero update in those
+/// directions preserves the predicted pose instead of allowing tangent drift.
+pub fn solve_icp_delta_observable(
+    system: &IcpLinearSystem,
+    damping: f32,
+    relative_eigenvalue_threshold: f32,
+) -> Option<IcpSolveResult> {
+    if system.used_count < 6
+        || !damping.is_finite()
+        || damping < 0.0
+        || !relative_eigenvalue_threshold.is_finite()
+        || !(0.0..1.0).contains(&relative_eigenvalue_threshold)
+        || system.h.iter().any(|value| !value.is_finite())
+        || system.b.iter().any(|value| !value.is_finite())
+    {
         return None;
     }
 
-    let mut h = system.h;
+    let rotation_diagonal_sum = (0..3).map(|i| system.h[(i, i)].max(0.0)).sum::<f32>();
+    let translation_diagonal_sum = (3..6).map(|i| system.h[(i, i)].max(0.0)).sum::<f32>();
+    if !rotation_diagonal_sum.is_finite()
+        || !translation_diagonal_sum.is_finite()
+        || rotation_diagonal_sum + translation_diagonal_sum <= f32::EPSILON
+    {
+        return None;
+    }
 
-    // Levenberg-Marquardt 安定化
-    if damping > 0.0 {
-        for i in 0..6 {
-            h[(i, i)] += damping;
+    // q = S*x with q_rot expressed as an equivalent displacement at the
+    // cloud's characteristic lever arm. A single scale per unit block keeps
+    // weak geometric directions weak; normalizing every diagonal separately
+    // would incorrectly make an unobservable direction look fully constrained.
+    let characteristic_length_m =
+        if translation_diagonal_sum > f32::EPSILON && rotation_diagonal_sum > f32::EPSILON {
+            (rotation_diagonal_sum / translation_diagonal_sum)
+                .sqrt()
+                .clamp(0.1, 100.0)
+        } else {
+            1.0
+        };
+    let scales = Vector6f::new(
+        characteristic_length_m,
+        characteristic_length_m,
+        characteristic_length_m,
+        1.0,
+        1.0,
+        1.0,
+    );
+
+    let mut normalized_h = Matrix6f::zeros();
+    let mut normalized_b = Vector6f::zeros();
+    for row in 0..6 {
+        normalized_b[row] = system.b[row] / scales[row];
+        for col in 0..6 {
+            normalized_h[(row, col)] = system.h[(row, col)] / (scales[row] * scales[col]);
         }
     }
+    normalized_h = (normalized_h + normalized_h.transpose()) * 0.5;
 
-    // Cholesky → LU フォールバック
-    if let Some(chol) = h.cholesky() {
-        return Some(chol.solve(&system.b));
+    let eigen = normalized_h.symmetric_eigen();
+    let max_eigenvalue = eigen.eigenvalues.max().max(0.0);
+    if !max_eigenvalue.is_finite() || max_eigenvalue <= f32::EPSILON {
+        return None;
     }
-    h.lu().solve(&system.b)
+
+    let cutoff = (max_eigenvalue * relative_eigenvalue_threshold).max(f32::EPSILON);
+    let mut normalized_delta = Vector6f::zeros();
+    let mut observable_rank = 0usize;
+    let mut min_retained = max_eigenvalue;
+
+    for i in 0..6 {
+        let eigenvalue = eigen.eigenvalues[i];
+        if !eigenvalue.is_finite() || eigenvalue < cutoff {
+            continue;
+        }
+
+        let direction = eigen.eigenvectors.column(i);
+        let projected_b = direction.dot(&normalized_b);
+        normalized_delta += direction * (projected_b / (eigenvalue + damping));
+        observable_rank += 1;
+        min_retained = min_retained.min(eigenvalue);
+    }
+
+    if observable_rank == 0 {
+        return None;
+    }
+
+    let mut delta = Vector6f::zeros();
+    for i in 0..6 {
+        delta[i] = normalized_delta[i] / scales[i];
+    }
+    if delta.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+
+    Some(IcpSolveResult {
+        delta,
+        observable_rank,
+        min_observable_eigenvalue_ratio: min_retained / max_eigenvalue,
+    })
 }
 
 /// delta から (R, t) を更新する。
@@ -152,17 +282,140 @@ pub fn compute_rmse(
     let sum_sq: f32 = correspondences
         .iter()
         .map(|corr| {
-            let target_pt = if corr.target_cell.is_point {
-                corr.target_cell.point.0
-            } else {
-                corr.target_cell.mean
-            };
             let transformed = r_mat * corr.src_point.coords + t_vec;
-            // let e = corr.plane_normal.dot(&(transformed - target_pt.coords));
             let e = corr.plane_normal.dot(&transformed) + corr.plane_d;
             e * e
         })
         .sum();
 
     (sum_sq / correspondences.len() as f32).sqrt()
+}
+
+pub fn compute_robust_cost(
+    correspondences: &[PointCorrespondence],
+    r_mat: &Matrix3<f32>,
+    t_vec: &Vector3<f32>,
+    huber_delta_m: f32,
+) -> f32 {
+    correspondences
+        .iter()
+        .map(|corr| {
+            let transformed = r_mat * corr.src_point.coords + t_vec;
+            let residual = corr.plane_normal.dot(&transformed) + corr.plane_d;
+            huber_loss(residual, huber_delta_m)
+        })
+        .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn diagonal_system(diagonal: [f32; 6], b: [f32; 6]) -> IcpLinearSystem {
+        let mut h = Matrix6f::zeros();
+        for (index, value) in diagonal.into_iter().enumerate() {
+            h[(index, index)] = value;
+        }
+        IcpLinearSystem {
+            h,
+            b: Vector6f::from_row_slice(&b),
+            cost: 0.0,
+            used_count: 100,
+        }
+    }
+
+    fn system_from_jacobians(jacobians: &[Vector6f], desired_delta: Vector6f) -> IcpLinearSystem {
+        let h = jacobians
+            .iter()
+            .fold(Matrix6f::zeros(), |sum, j| sum + j * j.transpose());
+        IcpLinearSystem {
+            h,
+            b: h * desired_delta,
+            cost: 0.0,
+            used_count: jacobians.len().max(6),
+        }
+    }
+
+    #[test]
+    fn observable_solver_keeps_only_wall_normal_translation() {
+        let system = diagonal_system(
+            [0.0, 0.0, 0.0, 100.0, 1e-4, 1e-4],
+            [0.0, 0.0, 0.0, 10.0, 1.0, -1.0],
+        );
+        let result = solve_icp_delta_observable(&system, 1e-6, 0.01).unwrap();
+
+        assert_eq!(result.observable_rank, 1);
+        assert!((result.delta[3] - 0.1).abs() < 1e-5);
+        assert_eq!(result.delta[4], 0.0);
+        assert_eq!(result.delta[5], 0.0);
+    }
+
+    #[test]
+    fn observable_solver_keeps_three_independent_translation_directions() {
+        let system = diagonal_system(
+            [0.0, 0.0, 0.0, 10.0, 10.0, 10.0],
+            [0.0, 0.0, 0.0, 1.0, 2.0, 3.0],
+        );
+        let result = solve_icp_delta_observable(&system, 1e-6, 0.01).unwrap();
+
+        assert_eq!(result.observable_rank, 3);
+        assert!((result.delta[3] - 0.1).abs() < 1e-5);
+        assert!((result.delta[4] - 0.2).abs() < 1e-5);
+        assert!((result.delta[5] - 0.3).abs() < 1e-5);
+    }
+
+    #[test]
+    fn floor_geometry_preserves_unobservable_xy_and_yaw_prediction() {
+        let normal = Vector3::z();
+        let jacobians: Vec<_> = (-2..=2)
+            .flat_map(|x| {
+                (-2..=2).map(move |y| {
+                    let point = Vector3::new(x as f32, y as f32, 0.0);
+                    let rotation = point.cross(&normal);
+                    Vector6f::new(rotation.x, rotation.y, rotation.z, 0.0, 0.0, 1.0)
+                })
+            })
+            .collect();
+        let desired = Vector6f::new(0.01, -0.02, 0.5, 1.0, -1.0, 0.1);
+        let result =
+            solve_icp_delta_observable(&system_from_jacobians(&jacobians, desired), 1e-6, 0.01)
+                .unwrap();
+
+        assert_eq!(result.observable_rank, 3);
+        assert!(result.delta[2].abs() < 1e-6);
+        assert!(result.delta[3].abs() < 1e-6);
+        assert!(result.delta[4].abs() < 1e-6);
+        assert!((result.delta[5] - 0.1).abs() < 1e-5);
+    }
+
+    #[test]
+    fn wall_geometry_preserves_tangent_translation_prediction() {
+        let normal = Vector3::x();
+        let jacobians: Vec<_> = (-2..=2)
+            .flat_map(|y| {
+                (-2..=2).map(move |z| {
+                    let point = Vector3::new(0.0, y as f32, z as f32);
+                    let rotation = point.cross(&normal);
+                    Vector6f::new(rotation.x, rotation.y, rotation.z, 1.0, 0.0, 0.0)
+                })
+            })
+            .collect();
+        let desired = Vector6f::new(0.5, 0.01, -0.02, 0.1, 1.0, -1.0);
+        let result =
+            solve_icp_delta_observable(&system_from_jacobians(&jacobians, desired), 1e-6, 0.01)
+                .unwrap();
+
+        assert_eq!(result.observable_rank, 3);
+        assert!(result.delta[0].abs() < 1e-6);
+        assert!((result.delta[3] - 0.1).abs() < 1e-5);
+        assert!(result.delta[4].abs() < 1e-6);
+        assert!(result.delta[5].abs() < 1e-6);
+    }
+
+    #[test]
+    fn huber_weight_limits_large_outliers() {
+        assert_eq!(huber_weight(0.05, 0.1), 1.0);
+        assert!((huber_weight(1.0, 0.1) - 0.1).abs() < 1e-6);
+        assert!(huber_loss(1.0, 0.1) < 0.5);
+    }
 }

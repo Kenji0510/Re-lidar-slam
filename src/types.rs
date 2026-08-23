@@ -85,8 +85,23 @@ pub struct FrameLog {
     pub frame_index: usize,
     pub timestamp: f64,
     pub icp_ok: bool,
-    /// Point-to-Plane RMSE [m]. None if ICP was not run (e.g. empty map on first frame).
+    /// Final Point-to-Plane RMSE [m]. May be present for a candidate that was
+    /// rejected by another quality gate; None when ICP produced no candidate.
     pub rmse: Option<f32>,
+    #[serde(default)]
+    pub correspondence_count: usize,
+    #[serde(default)]
+    pub correspondence_ratio: f32,
+    #[serde(default)]
+    pub observable_rank: usize,
+    #[serde(default)]
+    pub min_observable_eigenvalue_ratio: Option<f32>,
+    #[serde(default)]
+    pub icp_translation_correction_m: f32,
+    #[serde(default)]
+    pub icp_rotation_correction_deg: f32,
+    #[serde(default)]
+    pub map_updated: bool,
     /// Translation distance from previous frame [m].
     pub translation_m: f64,
     /// Rotation angle from previous frame [deg].
@@ -96,4 +111,31 @@ pub struct FrameLog {
     pub pose_x: f64,
     pub pose_y: f64,
     pub pose_z: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FrameLog;
+
+    #[test]
+    fn frame_log_reads_legacy_json_without_quality_fields() {
+        let json = r#"{
+            "frame_index": 1,
+            "timestamp": 2.0,
+            "icp_ok": true,
+            "rmse": 0.03,
+            "translation_m": 0.1,
+            "rotation_deg": 0.2,
+            "velocity_m_s": 1.0,
+            "pose_x": 1.0,
+            "pose_y": 2.0,
+            "pose_z": 3.0
+        }"#;
+
+        let log: FrameLog = serde_json::from_str(json).unwrap();
+        assert_eq!(log.correspondence_count, 0);
+        assert_eq!(log.correspondence_ratio, 0.0);
+        assert_eq!(log.observable_rank, 0);
+        assert!(!log.map_updated);
+    }
 }

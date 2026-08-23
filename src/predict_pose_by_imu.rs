@@ -98,8 +98,8 @@ pub fn predict_pose_by_imu(
         let acc_world = rotation * acc_local - gravity;
 
         // --- Update position and velocity ---
-        velocity += acc_world * dt;
         position += velocity * dt + 0.5 * acc_world * dt * dt;
+        velocity += acc_world * dt;
 
         // Update last_time for the next iteration
         last_time = sample.timestamp;
@@ -180,4 +180,36 @@ pub fn build_rotation_trajectory(
     }
 
     trajectory
+}
+
+#[cfg(test)]
+mod tests {
+    use nalgebra::{Matrix4, UnitQuaternion, Vector3};
+
+    use super::{G, predict_pose_by_imu};
+    use crate::types::IMU;
+
+    #[test]
+    fn constant_acceleration_uses_kinematic_position_update() {
+        let imu_data = vec![IMU {
+            timestamp: 1.0,
+            angular_velocity: [0.0; 3],
+            // One m/s^2 on X plus one g on Z, expressed in g units.
+            linear_acceleration: [(1.0 / G) as f32, 0.0, 1.0],
+        }];
+
+        let (pose, velocity) = predict_pose_by_imu(
+            &imu_data,
+            &UnitQuaternion::identity(),
+            &Matrix4::identity(),
+            &Vector3::zeros(),
+            0.0,
+            1.0,
+        );
+
+        assert!((pose[(0, 3)] - 0.5).abs() < 1e-6);
+        assert!(pose[(1, 3)].abs() < 1e-9);
+        assert!(pose[(2, 3)].abs() < 1e-6);
+        assert!((velocity.x - 1.0).abs() < 1e-6);
+    }
 }
