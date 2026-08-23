@@ -18,13 +18,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-const DATASET_DIR: &str = "data/input/08012026/08012026-airy96-mid70-07-church";
-const SAVE_ROOT_DIR: &str = "data/output/debug/08192026";
+const DATASET_DIR: &str = "/mnt/nas/share/avia/08222026/pcds/08222026-avia-10";
+const SAVE_ROOT_DIR: &str = "data/output/debug/08222026";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LidarModel {
     Mid70,
     Airy96,
+    Avia,
 }
 
 impl LidarModel {
@@ -32,7 +33,8 @@ impl LidarModel {
         match value.to_ascii_lowercase().as_str() {
             "mid70" | "mid-70" => Ok(Self::Mid70),
             "airy96" | "airy-96" | "airy" => Ok(Self::Airy96),
-            _ => bail!("unsupported LiDAR model '{value}'; expected 'mid70' or 'airy96'"),
+            "avia" | "livox-avia" => Ok(Self::Avia),
+            _ => bail!("unsupported LiDAR model '{value}'; expected 'mid70', 'airy96', or 'avia'"),
         }
     }
 
@@ -40,6 +42,7 @@ impl LidarModel {
         match self {
             Self::Mid70 => "mid-70",
             Self::Airy96 => "airy",
+            Self::Avia => "avia",
         }
     }
 
@@ -47,6 +50,7 @@ impl LidarModel {
         match self {
             Self::Mid70 => "mid70",
             Self::Airy96 => "airy96",
+            Self::Avia => "avia",
         }
     }
 
@@ -54,6 +58,7 @@ impl LidarModel {
         match self {
             Self::Mid70 => make_imu_to_mid70_rotation(),
             Self::Airy96 => make_imu_to_airy96_rotation(),
+            Self::Avia => make_imu_to_avia_rotation(),
         }
     }
 }
@@ -80,7 +85,9 @@ where
             "--lidar" => {
                 let value = args
                     .next()
-                    .ok_or_else(|| anyhow::anyhow!("--lidar requires 'mid70' or 'airy96'"))?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("--lidar requires 'mid70', 'airy96', or 'avia'")
+                    })?
                     .into_string()
                     .map_err(|_| anyhow::anyhow!("LiDAR model must be valid UTF-8"))?;
                 lidar_model = LidarModel::parse(&value)?;
@@ -96,14 +103,14 @@ where
 }
 
 fn print_usage() {
-    println!("Usage: re_lidar_slam [--lidar <mid70|airy96>]");
+    println!("Usage: re_lidar_slam [--lidar <mid70|airy96|avia>]");
     println!("  --lidar  Select the point-cloud sensor (default: mid70)");
 }
 
 // Mid-70 sparse-cloud preset.
 // The upper range matches the range used by the existing Mid-70 datasets.
 const MIN_DIST: f32 = 0.5;
-const MAX_DIST: f32 = 150.0;
+const MAX_DIST: f32 = 200.0;
 
 // Airy-96内蔵IMU座標からAiry-96 LiDAR座標への外部回転。
 // Quaternion (x, y, z, w): -0.705437, 0.708767, -0.00246579, 0.00097028
@@ -804,6 +811,12 @@ fn make_imu_to_airy96_rotation() -> UnitQuaternion<f64> {
     ))
 }
 
+/// Livox Avia内蔵IMU座標からLiDAR座標への回転を返す。
+/// Aviaの内蔵IMUとLiDARの座標軸は同じ向きなので、回転は単位回転になる。
+fn make_imu_to_avia_rotation() -> UnitQuaternion<f64> {
+    UnitQuaternion::identity()
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsString;
@@ -813,7 +826,8 @@ mod tests {
     use super::{
         CommandLineAction, IMU, LidarModel, MID70_ORIGIN_IN_AIRY96_Z_M,
         count_imu_samples_in_time_range, make_airy96_from_mid70_extrinsic,
-        make_imu_to_airy96_rotation, make_imu_to_mid70_rotation, parse_command_line,
+        make_imu_to_airy96_rotation, make_imu_to_avia_rotation, make_imu_to_mid70_rotation,
+        parse_command_line,
     };
 
     fn imu_sample(timestamp: f64) -> IMU {
@@ -850,12 +864,31 @@ mod tests {
     }
 
     #[test]
+    fn command_line_selects_avia() {
+        let CommandLineAction::Run(model) = parse_args(&["--lidar", "avia"]).unwrap() else {
+            panic!("expected run action");
+        };
+        assert_eq!(model, LidarModel::Avia);
+        assert_eq!(model.input_subdir(), "avia");
+        assert_eq!(model.name(), "avia");
+
+        let CommandLineAction::Run(model) = parse_args(&["--lidar=livox-avia"]).unwrap() else {
+            panic!("expected run action");
+        };
+        assert_eq!(model, LidarModel::Avia);
+    }
+
+    #[test]
     fn command_line_rejects_unknown_lidar() {
         let error = match parse_args(&["--lidar", "unknown"]) {
             Ok(_) => panic!("unknown LiDAR model must fail"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("expected 'mid70' or 'airy96'"));
+        assert!(
+            error
+                .to_string()
+                .contains("expected 'mid70', 'airy96', or 'avia'")
+        );
     }
 
     #[test]
@@ -896,5 +929,11 @@ mod tests {
         let direct = imu_to_airy96 * imu_vector;
 
         assert!((via_mid70 - direct).norm() < 1e-12);
+    }
+
+    #[test]
+    fn imu_to_avia_rotation_preserves_axes() {
+        let imu_vector = Vector3::new(0.3, -0.4, 0.5);
+        assert!((make_imu_to_avia_rotation() * imu_vector - imu_vector).norm() < 1e-12);
     }
 }
