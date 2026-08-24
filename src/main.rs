@@ -5,8 +5,8 @@ use re_lidar_slam::{
     file_handler::{load_imu_data, load_pcd_files, load_pcd_xyzit, save_pcd_xyz},
     find_nearest_points::pickup_valid_source_points,
     icp::{
-        apply_delta, build_robust_point_to_plane_system, compute_rmse, compute_robust_cost,
-        solve_icp_delta_observable,
+        Vector6f, apply_delta, build_robust_point_to_plane_system, compute_rmse,
+        compute_robust_cost, solve_icp_delta_observable,
     },
     predict_pose_by_imu::{align_imu_timestamps, build_rotation_trajectory, predict_pose_by_imu},
     types::{CurrentFrameInfo, FrameLog, IMU, PointXYZ, SLAMMap},
@@ -21,8 +21,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-const DATASET_DIR: &str = "/mnt/nas/share/avia/08222026/pcds/08222026-avia-11";
-const SAVE_ROOT_DIR: &str = "data/output/debug/08222026";
+const DATASET_DIR: &str = "/mnt/nas/share/avia/08232026/04";
+const SAVE_ROOT_DIR: &str = "data/output/debug/08232026";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LidarModel {
@@ -195,6 +195,14 @@ const ICP_TRANSLATION_DELTA_THRESHOLD_M: f32 = 0.001;
 const ICP_ROTATION_DELTA_THRESHOLD_DEG: f32 = 0.01;
 const LOCAL_SOURCE_TO_PLANE_MAX_DISTANCE_M: f32 = 0.15;
 const LOCAL_MIN_PLANARITY: f32 = 0.10;
+// If normal matching fails after a large IMU Z drift, retry once with a wider
+// neighborhood and looser source-to-plane gates. Only the world-Z component of
+// this coarse solve is applied; normal ICP must then validate and refine it.
+const ICP_VERTICAL_RECOVERY_SEARCH_RANGE: i32 = 6;
+const ICP_VERTICAL_RECOVERY_MAX_DIST_FACTOR: f32 = 6.0;
+const ICP_VERTICAL_RECOVERY_SOURCE_PLANE_SCORE_THRESHOLD: f32 = 0.0;
+const ICP_VERTICAL_RECOVERY_SOURCE_TO_PLANE_MAX_DISTANCE_M: f32 = 0.60;
+const ICP_VERTICAL_RECOVERY_MAX_TRANSLATION_CORRECTION_M: f32 = 0.60;
 const MIN_IMU_SAMPLES_PER_POINT_CLOUD_FRAME: usize = 5;
 
 const MAX_DIST_FOR_VOXEL_MAP: f32 = 150.0;
@@ -433,6 +441,9 @@ fn main() -> Result<()> {
         let mut final_observable_rank = 0usize;
         let mut final_eigenvalue_ratio: Option<f32> = None;
         let mut icp_ok = false; // ICP が有効な解を得られたか
+        let mut vertical_recovery_attempted = false;
+        let mut use_vertical_recovery_correspondences = false;
+        let mut vertical_recovery_pose = false;
 
         let loop_start = Instant::now();
 
@@ -443,16 +454,37 @@ fn main() -> Result<()> {
                 // 対応点をピックアップ
                 // - source はローカル座標、target (local_voxel_map) はワールド座標
                 // - 現在の (R,t) 推定値で source をワールド変換してから近傍探索
+                let recovery_iteration = use_vertical_recovery_correspondences;
+                let (
+                    search_range,
+                    max_dist_factor,
+                    source_plane_score_threshold,
+                    source_to_plane_max_distance_m,
+                ) = if recovery_iteration {
+                    (
+                        ICP_VERTICAL_RECOVERY_SEARCH_RANGE,
+                        ICP_VERTICAL_RECOVERY_MAX_DIST_FACTOR,
+                        ICP_VERTICAL_RECOVERY_SOURCE_PLANE_SCORE_THRESHOLD,
+                        ICP_VERTICAL_RECOVERY_SOURCE_TO_PLANE_MAX_DISTANCE_M,
+                    )
+                } else {
+                    (
+                        SEARCH_RANGE,
+                        MAX_DIST_FACTOR,
+                        LOCAL_SOURCE_PLANE_SCORE_THRESHOLD,
+                        LOCAL_SOURCE_TO_PLANE_MAX_DISTANCE_M,
+                    )
+                };
                 let pickup_start = Instant::now();
                 let correspondences = pickup_valid_source_points::<LOCAL_KNN_K>(
                     &source_voxel_map,
                     &slam_map.local_voxel_map.voxel_map,
                     slam_map.local_voxel_map.config.index_voxel_size,
-                    SEARCH_RANGE,
-                    MAX_DIST_FACTOR,
+                    search_range,
+                    max_dist_factor,
                     LOCAL_PLANE_POINT_DISTANCE_THRESHOLD_M,
-                    LOCAL_SOURCE_PLANE_SCORE_THRESHOLD,
-                    Some(LOCAL_SOURCE_TO_PLANE_MAX_DISTANCE_M),
+                    source_plane_score_threshold,
+                    Some(source_to_plane_max_distance_m),
                     Some(LOCAL_MIN_PLANARITY),
                     &r_mat,
                     &t_vec,
@@ -464,18 +496,38 @@ fn main() -> Result<()> {
                 };
                 let pickup_end = pickup_start.elapsed();
                 log::debug!(
-                    "ICP iter {_iter}: Picked up {} correspondences ({:.1}%) in {:.2?}",
+                    "ICP iter {_iter}{}: Picked up {} correspondences ({:.1}%) in {:.2?}",
+                    if recovery_iteration {
+                        " [vertical recovery]"
+                    } else {
+                        ""
+                    },
                     correspondences.len(),
                     correspondence_ratio * 100.0,
                     pickup_end
                 );
 
-                if correspondences.len() < min_correspondences {
+                // A coarse Z estimate only needs a stable planar subset. The
+                // recovered pose is still required to pass the normal 5% gate.
+                let required_correspondences = if recovery_iteration {
+                    ICP_MIN_CORRESPONDENCES
+                } else {
+                    min_correspondences
+                };
+                if correspondences.len() < required_correspondences {
                     log::warn!(
                         "ICP iter {_iter}: insufficient correspondences: {} < {}",
                         correspondences.len(),
-                        min_correspondences,
+                        required_correspondences,
                     );
+                    if !vertical_recovery_attempted {
+                        vertical_recovery_attempted = true;
+                        use_vertical_recovery_correspondences = true;
+                        log::warn!(
+                            "ICP iter {_iter}: retrying with world-Z-only recovery matching"
+                        );
+                        continue;
+                    }
                     break;
                 }
 
@@ -505,13 +557,24 @@ fn main() -> Result<()> {
                     break;
                 }
 
-                let delta_translation_m = solve_result.delta.fixed_rows::<3>(3).norm();
-                let delta_rotation_deg = solve_result.delta.fixed_rows::<3>(0).norm().to_degrees();
-                let (candidate_r, candidate_t) = apply_delta(&r_mat, &t_vec, &solve_result.delta);
+                let applied_delta = if recovery_iteration {
+                    retain_world_z_translation(&solve_result.delta)
+                } else {
+                    solve_result.delta
+                };
+
+                let delta_translation_m = applied_delta.fixed_rows::<3>(3).norm();
+                let delta_rotation_deg = applied_delta.fixed_rows::<3>(0).norm().to_degrees();
+                let (candidate_r, candidate_t) = apply_delta(&r_mat, &t_vec, &applied_delta);
                 let (total_translation_correction_m, total_rotation_correction_deg) =
                     pose_correction_magnitudes(&pred_r, &pred_t, &candidate_r, &candidate_t);
+                let max_translation_correction_m = if recovery_iteration || vertical_recovery_pose {
+                    ICP_VERTICAL_RECOVERY_MAX_TRANSLATION_CORRECTION_M
+                } else {
+                    ICP_MAX_TRANSLATION_CORRECTION_M
+                };
 
-                if total_translation_correction_m > ICP_MAX_TRANSLATION_CORRECTION_M
+                if total_translation_correction_m > max_translation_correction_m
                     || total_rotation_correction_deg > ICP_MAX_ROTATION_CORRECTION_DEG
                 {
                     log::warn!(
@@ -541,6 +604,16 @@ fn main() -> Result<()> {
                 r_mat = candidate_r;
                 t_vec = candidate_t;
                 icp_ok = true;
+                if recovery_iteration {
+                    vertical_recovery_pose = true;
+                    use_vertical_recovery_correspondences = false;
+                    previous_rmse = None;
+                    log::warn!(
+                        "ICP iter {_iter}: applied coarse world-Z recovery dz={:.4} m; \
+                         returning to normal matching for validation",
+                        applied_delta[5],
+                    );
+                }
                 let system_end = system_start.elapsed();
                 log::debug!(
                     "ICP iter {_iter}: Built point-to-plane system in {:.2?}",
@@ -570,6 +643,9 @@ fn main() -> Result<()> {
                 let rmse_converged = previous_rmse
                     .is_some_and(|previous| (previous - rmse).abs() < ICP_RMSE_CHANGE_THRESHOLD_M);
                 previous_rmse = Some(rmse);
+                if recovery_iteration {
+                    continue;
+                }
                 if rmse_converged
                     && delta_translation_m < ICP_TRANSLATION_DELTA_THRESHOLD_M
                     && delta_rotation_deg < ICP_ROTATION_DELTA_THRESHOLD_DEG
@@ -964,6 +1040,12 @@ fn pose_correction_magnitudes(
     (translation_m, rotation_deg)
 }
 
+fn retain_world_z_translation(delta: &Vector6f) -> Vector6f {
+    let mut vertical_delta = Vector6f::zeros();
+    vertical_delta[5] = delta[5];
+    vertical_delta
+}
+
 /// Mid-70座標の点をAiry-96座標へ写す外部変換 `T_airy96_from_mid70`。
 fn make_airy96_from_mid70_extrinsic() -> Matrix4<f64> {
     let rotation = Matrix3::<f64>::new(0.0, 1.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0);
@@ -1019,7 +1101,7 @@ mod tests {
         CommandLineAction, IMU, LidarModel, MID70_ORIGIN_IN_AIRY96_Z_M,
         count_imu_samples_in_time_range, make_airy96_from_mid70_extrinsic,
         make_imu_to_airy96_rotation, make_imu_to_avia_rotation, make_imu_to_mid70_rotation,
-        parse_command_line,
+        parse_command_line, retain_world_z_translation,
     };
 
     fn imu_sample(timestamp: f64) -> IMU {
@@ -1032,6 +1114,16 @@ mod tests {
 
     fn parse_args(args: &[&str]) -> anyhow::Result<CommandLineAction> {
         parse_command_line(args.iter().map(OsString::from))
+    }
+
+    #[test]
+    fn vertical_recovery_discards_rotation_and_xy_translation() {
+        let delta = re_lidar_slam::icp::Vector6f::new(1.0, 2.0, 3.0, 4.0, 5.0, -0.45);
+
+        assert_eq!(
+            retain_world_z_translation(&delta),
+            re_lidar_slam::icp::Vector6f::new(0.0, 0.0, 0.0, 0.0, 0.0, -0.45)
+        );
     }
 
     #[test]
