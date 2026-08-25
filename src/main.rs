@@ -9,7 +9,7 @@ use re_lidar_slam::{
         compute_robust_cost, solve_icp_delta_observable,
     },
     predict_pose_by_imu::{align_imu_timestamps, build_rotation_trajectory, predict_pose_by_imu},
-    types::{CurrentFrameInfo, FrameLog, IMU, PointXYZ, SLAMMap},
+    types::{CurrentFrameInfo, FrameLog, FrameTiming, IMU, PointXYZ, SLAMMap},
     voxel_map::{
         LOCALMap, LocalMapConfig, SurfaceFilterConfig, SurfaceStatus, WorldMapUpdateFilterConfig,
         build_voxel_map,
@@ -21,7 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const DATASET_DIR: &str = "/mnt/nas/share/avia/08232026/04";
+const DATASET_DIR: &str = "/mnt/nas/share/avia/08232026/01";
 const SAVE_ROOT_DIR: &str = "data/output/debug/08232026";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -444,6 +444,9 @@ fn main() -> Result<()> {
         let mut vertical_recovery_attempted = false;
         let mut use_vertical_recovery_correspondences = false;
         let mut vertical_recovery_pose = false;
+        let mut icp_correspondence_search_time = Duration::ZERO;
+        let mut icp_linear_system_time = Duration::ZERO;
+        let mut icp_solver_time = Duration::ZERO;
 
         let loop_start = Instant::now();
 
@@ -495,6 +498,7 @@ fn main() -> Result<()> {
                     0.0
                 };
                 let pickup_end = pickup_start.elapsed();
+                icp_correspondence_search_time += pickup_end;
                 log::debug!(
                     "ICP iter {_iter}{}: Picked up {} correspondences ({:.1}%) in {:.2?}",
                     if recovery_iteration {
@@ -539,12 +543,18 @@ fn main() -> Result<()> {
                     &t_vec,
                     ICP_HUBER_DELTA_M,
                 );
+                let system_end = system_start.elapsed();
+                icp_linear_system_time += system_end;
 
-                let Some(solve_result) = solve_icp_delta_observable(
+                let solve_start = Instant::now();
+                let solve_result = solve_icp_delta_observable(
                     &system,
                     ICP_DAMPING,
                     ICP_RELATIVE_EIGENVALUE_THRESHOLD,
-                ) else {
+                );
+                let solve_end = solve_start.elapsed();
+                icp_solver_time += solve_end;
+                let Some(solve_result) = solve_result else {
                     log::warn!("ICP iter {_iter}: observable solve failed");
                     break;
                 };
@@ -614,10 +624,10 @@ fn main() -> Result<()> {
                         applied_delta[5],
                     );
                 }
-                let system_end = system_start.elapsed();
                 log::debug!(
-                    "ICP iter {_iter}: Built point-to-plane system in {:.2?}",
-                    system_end
+                    "ICP iter {_iter}: point-to-plane system={:.2?}, solve={:.2?}",
+                    system_end,
+                    solve_end,
                 );
 
                 // RMSE を計算して収束チェック
@@ -661,6 +671,7 @@ fn main() -> Result<()> {
             // Rebuild correspondences at the accepted pose so stale matches cannot
             // make a bad final pose look valid.
             if icp_ok {
+                let final_pickup_start = Instant::now();
                 let correspondences = pickup_valid_source_points::<LOCAL_KNN_K>(
                     &source_voxel_map,
                     &slam_map.local_voxel_map.voxel_map,
@@ -674,6 +685,7 @@ fn main() -> Result<()> {
                     &r_mat,
                     &t_vec,
                 );
+                icp_correspondence_search_time += final_pickup_start.elapsed();
                 final_correspondence_count = correspondences.len();
                 final_correspondence_ratio = if source_point_count > 0 {
                     correspondences.len() as f32 / source_point_count as f32
@@ -682,17 +694,21 @@ fn main() -> Result<()> {
                 };
                 final_rmse = Some(compute_rmse(&correspondences, &r_mat, &t_vec));
 
+                let final_system_start = Instant::now();
                 let final_system = build_robust_point_to_plane_system(
                     &correspondences,
                     &r_mat,
                     &t_vec,
                     ICP_HUBER_DELTA_M,
                 );
+                icp_linear_system_time += final_system_start.elapsed();
+                let final_solve_start = Instant::now();
                 let final_solve = solve_icp_delta_observable(
                     &final_system,
                     ICP_DAMPING,
                     ICP_RELATIVE_EIGENVALUE_THRESHOLD,
                 );
+                icp_solver_time += final_solve_start.elapsed();
                 final_observable_rank = 0;
                 final_eigenvalue_ratio = None;
                 if let Some(result) = &final_solve {
@@ -776,25 +792,6 @@ fn main() -> Result<()> {
             (0.0, 0.0)
         };
         let map_update_allowed = local_map_was_empty || icp_ok;
-        frame_logs.push(FrameLog {
-            frame_index: i,
-            timestamp: current_frame_start_time,
-            icp_ok,
-            rmse: final_rmse.filter(|rmse| rmse.is_finite()),
-            correspondence_count: final_correspondence_count,
-            correspondence_ratio: final_correspondence_ratio,
-            observable_rank: final_observable_rank,
-            min_observable_eigenvalue_ratio: final_eigenvalue_ratio,
-            icp_translation_correction_m,
-            icp_rotation_correction_deg,
-            map_updated: map_update_allowed,
-            translation_m,
-            rotation_deg,
-            velocity_m_s: new_velocity.norm(),
-            pose_x: new_pos.x,
-            pose_y: new_pos.y,
-            pose_z: new_pos.z,
-        });
         // --- Record frame log ---
         let pose_update_time = pose_update_start.elapsed();
 
@@ -887,6 +884,30 @@ fn main() -> Result<()> {
 
         let frame_processing_time = frame_processing_start.elapsed();
         let frame_total_with_file_io = frame_start.elapsed();
+        let measured_icp_detail =
+            icp_correspondence_search_time + icp_linear_system_time + icp_solver_time;
+        let icp_other_time = loop_end.saturating_sub(measured_icp_detail);
+        let timing = FrameTiming {
+            load_pcd_ms: duration_ms(load_pcd_time),
+            timestamps_ms: duration_ms(timestamp_time),
+            imu_predict_ms: duration_ms(predict_pose_time),
+            rotation_trajectory_ms: duration_ms(rotation_trajectory_time),
+            deskew_ms: duration_ms(deskew_time),
+            downsample_ms: duration_ms(voxel_end),
+            build_source_maps_ms: duration_ms(build_map_end),
+            icp_ms: duration_ms(loop_end),
+            pose_update_ms: duration_ms(pose_update_time),
+            global_filter_ms: duration_ms(global_filter_time),
+            global_map_update_ms: duration_ms(global_map_update_time),
+            delayed_surface_ms: duration_ms(delayed_surface_time),
+            local_map_update_ms: duration_ms(local_map_update_time),
+            processing_total_ms: duration_ms(frame_processing_time),
+            total_with_file_io_ms: duration_ms(frame_total_with_file_io),
+            icp_correspondence_search_ms: duration_ms(icp_correspondence_search_time),
+            icp_linear_system_ms: duration_ms(icp_linear_system_time),
+            icp_solver_ms: duration_ms(icp_solver_time),
+            icp_other_ms: duration_ms(icp_other_time),
+        };
         log::debug!(
             "Frame {i} timings [ms]: load_pcd={:.3} ms, timestamps={:.3} ms, \
              imu_predict={:.3} ms, rotation_trajectory={:.3} ms, deskew={:.3} ms, \
@@ -910,7 +931,38 @@ fn main() -> Result<()> {
             duration_ms(frame_processing_time),
             duration_ms(frame_total_with_file_io),
         );
+        log::debug!(
+            "Frame {i} ICP breakdown [ms]: correspondence_search={:.3}, \
+             linear_system={:.3}, solver={:.3}, other={:.3}, total={:.3}",
+            timing.icp_correspondence_search_ms,
+            timing.icp_linear_system_ms,
+            timing.icp_solver_ms,
+            timing.icp_other_ms,
+            timing.icp_ms,
+        );
+        frame_logs.push(FrameLog {
+            frame_index: i,
+            timestamp: current_frame_start_time,
+            icp_ok,
+            rmse: final_rmse.filter(|rmse| rmse.is_finite()),
+            correspondence_count: final_correspondence_count,
+            correspondence_ratio: final_correspondence_ratio,
+            observable_rank: final_observable_rank,
+            min_observable_eigenvalue_ratio: final_eigenvalue_ratio,
+            icp_translation_correction_m,
+            icp_rotation_correction_deg,
+            map_updated: map_update_allowed,
+            translation_m,
+            rotation_deg,
+            velocity_m_s: new_velocity.norm(),
+            pose_x: new_pos.x,
+            pose_y: new_pos.y,
+            pose_z: new_pos.z,
+            timing,
+        });
     }
+
+    log_timing_summary(&frame_logs);
 
     // --- Save the global voxel maps before and after final plane classification ---
     let min_samples = slam_map.global_voxel_map.config.min_points_per_voxel as u64;
@@ -1023,6 +1075,132 @@ fn main() -> Result<()> {
 #[inline]
 fn duration_ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
+}
+
+#[derive(Debug)]
+struct TimingStats {
+    name: &'static str,
+    mean_ms: f64,
+    p95_ms: f64,
+    max_ms: f64,
+}
+
+fn log_timing_summary(frame_logs: &[FrameLog]) {
+    if frame_logs.is_empty() {
+        return;
+    }
+
+    let stages: [(&str, fn(&FrameTiming) -> f64); 13] = [
+        ("load_pcd", |t| t.load_pcd_ms),
+        ("timestamps", |t| t.timestamps_ms),
+        ("imu_predict", |t| t.imu_predict_ms),
+        ("rotation_trajectory", |t| t.rotation_trajectory_ms),
+        ("deskew", |t| t.deskew_ms),
+        ("downsample", |t| t.downsample_ms),
+        ("build_source_maps", |t| t.build_source_maps_ms),
+        ("icp", |t| t.icp_ms),
+        ("pose_update", |t| t.pose_update_ms),
+        ("global_filter", |t| t.global_filter_ms),
+        ("global_map_update", |t| t.global_map_update_ms),
+        ("delayed_surface", |t| t.delayed_surface_ms),
+        ("local_map_update", |t| t.local_map_update_ms),
+    ];
+    let mut summaries: Vec<TimingStats> = stages
+        .into_iter()
+        .map(|(name, get)| timing_stats(name, frame_logs, get))
+        .collect();
+    summaries.sort_by(|left, right| right.mean_ms.total_cmp(&left.mean_ms));
+
+    let processing_total = timing_stats("processing_total", frame_logs, |t| t.processing_total_ms);
+    let wall_total = timing_stats("total_with_file_io", frame_logs, |t| {
+        t.total_with_file_io_ms
+    });
+    log::info!(
+        "Timing summary for {} frames [ms]: processing mean={:.3}, p95={:.3}, max={:.3}; \
+         with_file_io mean={:.3}, p95={:.3}, max={:.3}",
+        frame_logs.len(),
+        processing_total.mean_ms,
+        processing_total.p95_ms,
+        processing_total.max_ms,
+        wall_total.mean_ms,
+        wall_total.p95_ms,
+        wall_total.max_ms,
+    );
+    for (rank, summary) in summaries.iter().enumerate() {
+        let share = if wall_total.mean_ms > 0.0 {
+            summary.mean_ms / wall_total.mean_ms * 100.0
+        } else {
+            0.0
+        };
+        log::info!(
+            "Timing rank {:>2}: {:<20} mean={:>9.3} ms ({:>5.1}%), p95={:>9.3} ms, max={:>9.3} ms",
+            rank + 1,
+            summary.name,
+            summary.mean_ms,
+            share,
+            summary.p95_ms,
+            summary.max_ms,
+        );
+    }
+
+    let icp_details: [(&str, fn(&FrameTiming) -> f64); 4] = [
+        ("correspondence_search", |t| t.icp_correspondence_search_ms),
+        ("linear_system", |t| t.icp_linear_system_ms),
+        ("solver", |t| t.icp_solver_ms),
+        ("other", |t| t.icp_other_ms),
+    ];
+    let mut icp_summaries: Vec<TimingStats> = icp_details
+        .into_iter()
+        .map(|(name, get)| timing_stats(name, frame_logs, get))
+        .collect();
+    icp_summaries.sort_by(|left, right| right.mean_ms.total_cmp(&left.mean_ms));
+    for summary in icp_summaries {
+        let share = if summaries
+            .iter()
+            .find(|summary| summary.name == "icp")
+            .is_some_and(|summary| summary.mean_ms > 0.0)
+        {
+            let icp_mean = summaries
+                .iter()
+                .find(|summary| summary.name == "icp")
+                .map_or(0.0, |summary| summary.mean_ms);
+            summary.mean_ms / icp_mean * 100.0
+        } else {
+            0.0
+        };
+        log::info!(
+            "ICP timing: {:<21} mean={:>9.3} ms ({:>5.1}% of ICP), p95={:>9.3} ms, max={:>9.3} ms",
+            summary.name,
+            summary.mean_ms,
+            share,
+            summary.p95_ms,
+            summary.max_ms,
+        );
+    }
+}
+
+fn timing_stats(
+    name: &'static str,
+    frame_logs: &[FrameLog],
+    get: fn(&FrameTiming) -> f64,
+) -> TimingStats {
+    let mut values: Vec<f64> = frame_logs
+        .iter()
+        .map(|frame| get(&frame.timing))
+        .filter(|value| value.is_finite())
+        .collect();
+    values.sort_by(f64::total_cmp);
+    let mean_ms = values.iter().sum::<f64>() / values.len().max(1) as f64;
+    let p95_index = ((values.len() as f64 * 0.95).ceil() as usize)
+        .saturating_sub(1)
+        .min(values.len().saturating_sub(1));
+
+    TimingStats {
+        name,
+        mean_ms,
+        p95_ms: values.get(p95_index).copied().unwrap_or_default(),
+        max_ms: values.last().copied().unwrap_or_default(),
+    }
 }
 
 fn pose_correction_magnitudes(

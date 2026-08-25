@@ -50,7 +50,7 @@ pub struct SurfacePlane {
     pub inlier_count: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SurfaceFilterConfig {
     /// 2 の場合、中心を含む 5x5x5 ボクセルを平面推定に使う。
     pub neighbor_radius_voxels: i32,
@@ -78,6 +78,7 @@ pub struct SurfaceClassificationStats {
     pub planar: usize,
     pub non_planar: usize,
     pub unknown: usize,
+    pub skipped_unchanged: usize,
 }
 
 /// 成熟した GlobalMap 平面を使って新規観測を更新するための設定。
@@ -164,6 +165,11 @@ pub struct VoxelCell {
     /// 観測データは保持したまま、平面マップへの出力可否だけを表す。
     pub surface_status: SurfaceStatus,
     pub surface_plane: Option<SurfacePlane>,
+
+    /// このセルの平面判定に使用した SurfaceFilterConfig の世代。
+    pub surface_evaluation_epoch: u64,
+    /// このフレームまでの累積マップを使って平面判定済みであることを表す。
+    pub surface_evaluated_through_frame_id: Option<u64>,
 }
 
 pub struct FrameEntry {
@@ -193,6 +199,8 @@ pub struct LOCALMap {
     pub config: LocalMapConfig,
     pub next_frame_id: u64,
     pending_voxel_map: FxHashMap<VoxelKey, PendingVoxelCell>,
+    surface_filter_config: Option<SurfaceFilterConfig>,
+    surface_evaluation_epoch: u64,
 }
 
 impl LOCALMap {
@@ -203,6 +211,8 @@ impl LOCALMap {
             config,
             next_frame_id: 0,
             pending_voxel_map: FxHashMap::default(),
+            surface_filter_config: None,
+            surface_evaluation_epoch: 0,
         }
     }
 
@@ -513,22 +523,74 @@ impl LOCALMap {
         delay_frames: u64,
         filter_config: &SurfaceFilterConfig,
     ) -> SurfaceClassificationStats {
+        let profile_enabled = log::log_enabled!(log::Level::Info);
+        let total_start = profile_enabled.then(Instant::now);
         let Some(current_frame_id) = self.next_frame_id.checked_sub(1) else {
             return SurfaceClassificationStats::default();
         };
 
-        let mut dirty_keys = FxHashSet::default();
+        let queue_drain_start = profile_enabled.then(Instant::now);
+        let mut dirty_versions = FxHashMap::default();
         while self
             .frame_index
             .front()
             .is_some_and(|entry| current_frame_id.saturating_sub(entry.frame_id) >= delay_frames)
         {
             if let Some(entry) = self.frame_index.pop_front() {
-                dirty_keys.extend(entry.dirty_keys);
+                for key in entry.dirty_keys {
+                    dirty_versions
+                        .entry(key)
+                        .and_modify(|frame_id: &mut u64| {
+                            *frame_id = (*frame_id).max(entry.frame_id);
+                        })
+                        .or_insert(entry.frame_id);
+                }
             }
         }
+        let queue_drain_wall = queue_drain_start
+            .map(|start| start.elapsed())
+            .unwrap_or_default();
 
-        self.classify_surface_voxels_affected_by(&dirty_keys, filter_config)
+        let config_epoch_start = profile_enabled.then(Instant::now);
+        let evaluation_epoch = self.surface_evaluation_epoch(filter_config);
+        let config_epoch_wall = config_epoch_start
+            .map(|start| start.elapsed())
+            .unwrap_or_default();
+        let affected_classification_start = profile_enabled.then(Instant::now);
+        let stats = self.classify_surface_voxels_affected_by(
+            &dirty_versions,
+            filter_config,
+            current_frame_id,
+            evaluation_epoch,
+            profile_enabled,
+        );
+        let affected_classification_wall = affected_classification_start
+            .map(|start| start.elapsed())
+            .unwrap_or_default();
+
+        if profile_enabled {
+            let total_wall = total_start.map(|start| start.elapsed()).unwrap_or_default();
+            let other_wall = total_wall
+                .saturating_sub(queue_drain_wall)
+                .saturating_sub(config_epoch_wall)
+                .saturating_sub(affected_classification_wall);
+            log::info!(
+                "Delayed surface realtime frame={current_frame_id}: \
+                 classify_delayed_surface_voxels wall_ms total={:.3}, queue_drain={:.3}, \
+                 config_epoch={:.3}, classify_affected={:.3}, other={:.3} | \
+                 dirty={}, evaluated={}, skipped_unchanged={}",
+                duration_ms(total_wall),
+                duration_ms(queue_drain_wall),
+                duration_ms(config_epoch_wall),
+                duration_ms(affected_classification_wall),
+                duration_ms(other_wall),
+                dirty_versions.len(),
+                stats.evaluated,
+                stats.skipped_unchanged,
+            );
+        }
+
+        stats
     }
 
     /// 全ボクセルを現在の累積点で再判定する。終了時の最終確定用。
@@ -536,63 +598,103 @@ impl LOCALMap {
         &mut self,
         filter_config: &SurfaceFilterConfig,
     ) -> SurfaceClassificationStats {
+        let evaluation_epoch = self.surface_evaluation_epoch(filter_config);
+        let current_frame_id = self.next_frame_id.checked_sub(1);
         let center_keys: Vec<VoxelKey> = self.voxel_map.keys().copied().collect();
-        self.classify_surface_voxels(&center_keys, filter_config, false)
-            .0
+        self.classify_surface_voxels(
+            &center_keys,
+            filter_config,
+            false,
+            current_frame_id,
+            evaluation_epoch,
+        )
+        .0
     }
 
     fn classify_surface_voxels_affected_by(
         &mut self,
-        dirty_keys: &FxHashSet<VoxelKey>,
+        dirty_versions: &FxHashMap<VoxelKey, u64>,
         filter_config: &SurfaceFilterConfig,
+        current_frame_id: u64,
+        evaluation_epoch: u64,
+        profile_enabled: bool,
     ) -> SurfaceClassificationStats {
-        if dirty_keys.is_empty() {
+        if dirty_versions.is_empty() {
             return SurfaceClassificationStats::default();
         }
 
-        let profile_enabled = log::log_enabled!(log::Level::Debug);
         let total_start = profile_enabled.then(Instant::now);
         let candidate_generation_start = profile_enabled.then(Instant::now);
         let radius = filter_config.neighbor_radius_voxels.max(0);
-        let center_keys = {
+        let affected_center_versions = {
             let voxel_map = &self.voxel_map;
 
             // dirty voxel は、周囲 radius 内の各中心ボクセルの平面推定に影響する。
-            // ワーカごとの Set で重複を除去してから統合し、共有 Set のロック競合を避ける。
-            dirty_keys
+            // 各中心には、影響する dirty voxel の最新フレームを記録する。
+            // ワーカごとの Map を最後に統合し、共有 Map のロック競合を避ける。
+            dirty_versions
                 .par_iter()
-                .fold(FxHashSet::default, |mut local_center_keys, dirty_key| {
-                    for dz in -radius..=radius {
-                        for dy in -radius..=radius {
-                            for dx in -radius..=radius {
-                                let center_key = VoxelKey {
-                                    ix: dirty_key.ix + dx,
-                                    iy: dirty_key.iy + dy,
-                                    iz: dirty_key.iz + dz,
-                                };
-                                if voxel_map.contains_key(&center_key) {
-                                    local_center_keys.insert(center_key);
+                .fold(
+                    FxHashMap::default,
+                    |mut local_centers, (dirty_key, dirty_frame_id)| {
+                        for dz in -radius..=radius {
+                            for dy in -radius..=radius {
+                                for dx in -radius..=radius {
+                                    let center_key = VoxelKey {
+                                        ix: dirty_key.ix + dx,
+                                        iy: dirty_key.iy + dy,
+                                        iz: dirty_key.iz + dz,
+                                    };
+                                    if voxel_map.contains_key(&center_key) {
+                                        local_centers
+                                            .entry(center_key)
+                                            .and_modify(|frame_id: &mut u64| {
+                                                *frame_id = (*frame_id).max(*dirty_frame_id);
+                                            })
+                                            .or_insert(*dirty_frame_id);
+                                    }
                                 }
                             }
                         }
-                    }
 
-                    local_center_keys
-                })
-                .reduce(FxHashSet::default, merge_voxel_key_sets)
+                        local_centers
+                    },
+                )
+                .reduce(FxHashMap::default, merge_voxel_key_versions)
         };
 
         let candidate_generation_wall = candidate_generation_start
             .map(|start| start.elapsed())
             .unwrap_or_default();
-        let center_keys: Vec<VoxelKey> = center_keys.into_iter().collect();
-        let center_count = center_keys.len();
-        let (stats, timings) =
-            self.classify_surface_voxels(&center_keys, filter_config, profile_enabled);
+        let unchanged_filter_start = profile_enabled.then(Instant::now);
+        let affected_center_count = affected_center_versions.len();
+        let center_keys: Vec<VoxelKey> = affected_center_versions
+            .into_iter()
+            .filter_map(|(key, dirty_frame_id)| {
+                let cell = self.voxel_map.get(&key)?;
+                let config_changed = cell.surface_evaluation_epoch != evaluation_epoch;
+                let has_unseen_update = cell
+                    .surface_evaluated_through_frame_id
+                    .is_none_or(|evaluated_frame_id| evaluated_frame_id < dirty_frame_id);
+                (config_changed || has_unseen_update).then_some(key)
+            })
+            .collect();
+        let unchanged_filter_wall = unchanged_filter_start
+            .map(|start| start.elapsed())
+            .unwrap_or_default();
+        let skipped_unchanged = affected_center_count.saturating_sub(center_keys.len());
+        let (mut stats, timings) = self.classify_surface_voxels(
+            &center_keys,
+            filter_config,
+            profile_enabled,
+            Some(current_frame_id),
+            evaluation_epoch,
+        );
+        stats.skipped_unchanged = skipped_unchanged;
 
         if profile_enabled {
             let neighborhood_width = (radius as usize).saturating_mul(2).saturating_add(1);
-            let candidate_probes = dirty_keys.len().saturating_mul(
+            let candidate_probes = dirty_versions.len().saturating_mul(
                 neighborhood_width
                     .saturating_mul(neighborhood_width)
                     .saturating_mul(neighborhood_width),
@@ -600,8 +702,8 @@ impl LOCALMap {
             let total_wall = total_start.map(|start| start.elapsed()).unwrap_or_default();
             let wall_overhead = total_wall
                 .saturating_sub(candidate_generation_wall)
-                .saturating_sub(timings.parallel_evaluation_wall)
-                .saturating_sub(timings.result_apply_wall);
+                .saturating_sub(unchanged_filter_wall)
+                .saturating_sub(timings.total_wall);
             let worker_time_sum = timings.neighborhood_cpu_sum
                 + timings.ransac_cpu_sum
                 + timings.pca_cpu_sum
@@ -620,22 +722,40 @@ impl LOCALMap {
             let point_test_skip_percent =
                 percentage(timings.ransac_point_tests_skipped, point_test_total);
 
-            log::debug!(
-                "Delayed surface wall [ms]: total={:.3}, candidates={:.3}, evaluation={:.3}, \
-                 apply={:.3}, overhead={:.3} | dirty={}, probes={}, centers={}, evaluated={}",
+            let classification_other_wall = timings
+                .total_wall
+                .saturating_sub(timings.parallel_evaluation_wall)
+                .saturating_sub(timings.evaluation_reduce_wall)
+                .saturating_sub(timings.result_apply_wall);
+
+            log::info!(
+                "Delayed surface realtime frame={current_frame_id}: \
+                 classify_surface_voxels_affected_by wall_ms total={:.3}, \
+                 candidate_generation={:.3}, unchanged_filter={:.3}, \
+                 classify_surface_voxels={:.3}, other={:.3} | dirty={}, probes={}, \
+                 affected_centers={}, skipped_unchanged={}, evaluated={}",
                 duration_ms(total_wall),
                 duration_ms(candidate_generation_wall),
-                duration_ms(timings.parallel_evaluation_wall),
-                duration_ms(timings.result_apply_wall),
+                duration_ms(unchanged_filter_wall),
+                duration_ms(timings.total_wall),
                 duration_ms(wall_overhead),
-                dirty_keys.len(),
+                dirty_versions.len(),
                 candidate_probes,
-                center_count,
+                affected_center_count,
+                skipped_unchanged,
                 stats.evaluated,
             );
-            log::debug!(
-                "Delayed surface worker sum [ms]: total={:.3}, neighbors={:.3}, ransac={:.3}, \
-                 pca={:.3}, other={:.3} | effective_parallelism={:.2}x",
+            log::info!(
+                "Delayed surface realtime frame={current_frame_id}: classify_surface_voxels \
+                 wall_ms total={:.3}, parallel_evaluation={:.3}, timing_reduce={:.3}, \
+                 result_apply={:.3}, other={:.3} | evaluate_surface_voxel worker_sum_ms \
+                 total={:.3}, neighborhood={:.3}, ransac_plane_inliers={:.3}, \
+                 fit_plane_pca={:.3}, other={:.3} | effective_parallelism={:.2}x",
+                duration_ms(timings.total_wall),
+                duration_ms(timings.parallel_evaluation_wall),
+                duration_ms(timings.evaluation_reduce_wall),
+                duration_ms(timings.result_apply_wall),
+                duration_ms(classification_other_wall),
                 duration_ms(worker_time_sum),
                 duration_ms(timings.neighborhood_cpu_sum),
                 duration_ms(timings.ransac_cpu_sum),
@@ -669,7 +789,10 @@ impl LOCALMap {
         center_keys: &[VoxelKey],
         filter_config: &SurfaceFilterConfig,
         profile_enabled: bool,
+        current_frame_id: Option<u64>,
+        evaluation_epoch: u64,
     ) -> (SurfaceClassificationStats, SurfaceClassificationTimings) {
+        let total_start = profile_enabled.then(Instant::now);
         let radius = filter_config.neighbor_radius_voxels.max(0) as usize;
         let neighborhood_width = radius * 2 + 1;
         let max_neighbor_points = neighborhood_width
@@ -700,6 +823,7 @@ impl LOCALMap {
             .map(|start| start.elapsed())
             .unwrap_or_default();
 
+        let evaluation_reduce_start = profile_enabled.then(Instant::now);
         let evaluation_cpu_sums = evaluations.iter().fold(
             SurfaceEvaluationTimings::default(),
             |mut total, (_, evaluation)| {
@@ -707,6 +831,9 @@ impl LOCALMap {
                 total
             },
         );
+        let evaluation_reduce_wall = evaluation_reduce_start
+            .map(|start| start.elapsed())
+            .unwrap_or_default();
 
         let result_apply_start = profile_enabled.then(Instant::now);
         let mut stats = SurfaceClassificationStats::default();
@@ -717,6 +844,8 @@ impl LOCALMap {
 
             cell.surface_status = evaluation.status;
             cell.surface_plane = evaluation.plane;
+            cell.surface_evaluation_epoch = evaluation_epoch;
+            cell.surface_evaluated_through_frame_id = current_frame_id;
             stats.evaluated += 1;
             match evaluation.status {
                 SurfaceStatus::Unknown => stats.unknown += 1,
@@ -727,11 +856,14 @@ impl LOCALMap {
         let result_apply_wall = result_apply_start
             .map(|start| start.elapsed())
             .unwrap_or_default();
+        let total_wall = total_start.map(|start| start.elapsed()).unwrap_or_default();
 
         (
             stats,
             SurfaceClassificationTimings {
+                total_wall,
                 parallel_evaluation_wall,
+                evaluation_reduce_wall,
                 neighborhood_cpu_sum: evaluation_cpu_sums.neighborhood,
                 ransac_cpu_sum: evaluation_cpu_sums.ransac,
                 pca_cpu_sum: evaluation_cpu_sums.pca,
@@ -747,17 +879,33 @@ impl LOCALMap {
             },
         )
     }
+
+    fn surface_evaluation_epoch(&mut self, filter_config: &SurfaceFilterConfig) -> u64 {
+        if self.surface_filter_config.as_ref() != Some(filter_config) {
+            self.surface_filter_config = Some(*filter_config);
+            self.surface_evaluation_epoch = self
+                .surface_evaluation_epoch
+                .checked_add(1)
+                .expect("surface evaluation epoch overflow");
+        }
+
+        self.surface_evaluation_epoch
+    }
 }
 
-fn merge_voxel_key_sets(
-    mut left: FxHashSet<VoxelKey>,
-    mut right: FxHashSet<VoxelKey>,
-) -> FxHashSet<VoxelKey> {
-    // 小さい Set を大きい Set へ追加し、再ハッシュと挿入回数を抑える。
+fn merge_voxel_key_versions(
+    mut left: FxHashMap<VoxelKey, u64>,
+    mut right: FxHashMap<VoxelKey, u64>,
+) -> FxHashMap<VoxelKey, u64> {
+    // 小さい Map を大きい Map へ追加し、再ハッシュと挿入回数を抑える。
     if left.len() < right.len() {
         std::mem::swap(&mut left, &mut right);
     }
-    left.extend(right);
+    for (key, frame_id) in right {
+        left.entry(key)
+            .and_modify(|existing| *existing = (*existing).max(frame_id))
+            .or_insert(frame_id);
+    }
     left
 }
 
@@ -808,7 +956,9 @@ impl SurfaceEvaluationTimings {
 
 #[derive(Debug, Clone, Copy, Default)]
 struct SurfaceClassificationTimings {
+    total_wall: Duration,
     parallel_evaluation_wall: Duration,
+    evaluation_reduce_wall: Duration,
     neighborhood_cpu_sum: Duration,
     ransac_cpu_sum: Duration,
     pca_cpu_sum: Duration,
@@ -1230,6 +1380,8 @@ impl VoxelCell {
 
             surface_status: SurfaceStatus::Unknown,
             surface_plane: None,
+            surface_evaluation_epoch: 0,
+            surface_evaluated_through_frame_id: None,
         }
     }
 
@@ -1252,6 +1404,8 @@ impl VoxelCell {
 
             surface_status: SurfaceStatus::Unknown,
             surface_plane: None,
+            surface_evaluation_epoch: 0,
+            surface_evaluated_through_frame_id: None,
         }
     }
 
@@ -1669,6 +1823,48 @@ mod tests {
         );
         assert_eq!(map.frame_index.len(), 2);
         assert_eq!(map.frame_index.front().unwrap().frame_id, 1);
+
+        // フレーム 2 の評価は、その時点の累積マップ（フレーム 0..=2）を使用済み。
+        // 後から解放されるフレーム 1, 2 の dirty entry では再評価しない。
+        map.update_world_map(&points, &pose);
+        let stats = map.classify_delayed_surface_voxels(2, &filter_config);
+        assert_eq!(stats.evaluated, 0);
+        assert_eq!(stats.skipped_unchanged, 1);
+
+        map.update_world_map(&points, &pose);
+        let stats = map.classify_delayed_surface_voxels(2, &filter_config);
+        assert_eq!(stats.evaluated, 0);
+        assert_eq!(stats.skipped_unchanged, 1);
+
+        // フレーム 3 は前回評価より新しいため、delay 経過後に再評価する。
+        map.update_world_map(&points, &pose);
+        let stats = map.classify_delayed_surface_voxels(2, &filter_config);
+        assert_eq!(stats.evaluated, 1);
+        assert_eq!(stats.skipped_unchanged, 0);
+    }
+
+    #[test]
+    fn delayed_classification_re_evaluates_after_filter_config_change() {
+        let mut map = LOCALMap::new(map_config());
+        let pose = Matrix4::<f64>::identity();
+        let points = [Point3::new(0.01, 0.01, 0.01)];
+        let filter_config = surface_filter_config();
+
+        for _ in 0..3 {
+            map.update_world_map(&points, &pose);
+        }
+        assert_eq!(
+            map.classify_delayed_surface_voxels(2, &filter_config)
+                .evaluated,
+            1
+        );
+
+        map.update_world_map(&points, &pose);
+        let mut changed_config = filter_config;
+        changed_config.min_neighbors += 1;
+        let stats = map.classify_delayed_surface_voxels(2, &changed_config);
+        assert_eq!(stats.evaluated, 1);
+        assert_eq!(stats.skipped_unchanged, 0);
     }
 
     #[test]

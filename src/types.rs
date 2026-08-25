@@ -80,6 +80,41 @@ pub struct ProcessTimes {
     pub update_map: f64,
 }
 
+/// Wall-clock timings for one point-cloud frame, in milliseconds.
+///
+/// The top-level stages do not overlap and can therefore be compared directly.
+/// The `icp_*` detail fields are a breakdown of `icp_ms` and must not be added
+/// to the top-level stages a second time.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FrameTiming {
+    pub load_pcd_ms: f64,
+    pub timestamps_ms: f64,
+    pub imu_predict_ms: f64,
+    pub rotation_trajectory_ms: f64,
+    pub deskew_ms: f64,
+    pub downsample_ms: f64,
+    pub build_source_maps_ms: f64,
+    pub icp_ms: f64,
+    pub pose_update_ms: f64,
+    pub global_filter_ms: f64,
+    pub global_map_update_ms: f64,
+    pub delayed_surface_ms: f64,
+    pub local_map_update_ms: f64,
+    /// Per-frame processing time excluding PCD file I/O.
+    pub processing_total_ms: f64,
+    /// Per-frame wall time including PCD file I/O.
+    pub total_with_file_io_ms: f64,
+    /// Time spent finding ICP correspondences, including final validation.
+    pub icp_correspondence_search_ms: f64,
+    /// Time spent building ICP point-to-plane linear systems.
+    pub icp_linear_system_ms: f64,
+    /// Time spent solving ICP linear systems.
+    pub icp_solver_ms: f64,
+    /// Remaining ICP work, calculated from `icp_ms`.
+    pub icp_other_ms: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrameLog {
     pub frame_index: usize,
@@ -111,6 +146,8 @@ pub struct FrameLog {
     pub pose_x: f64,
     pub pose_y: f64,
     pub pose_z: f64,
+    #[serde(default)]
+    pub timing: FrameTiming,
 }
 
 #[cfg(test)]
@@ -137,5 +174,6 @@ mod tests {
         assert_eq!(log.correspondence_ratio, 0.0);
         assert_eq!(log.observable_rank, 0);
         assert!(!log.map_updated);
+        assert_eq!(log.timing.processing_total_ms, 0.0);
     }
 }
