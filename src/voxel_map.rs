@@ -79,6 +79,7 @@ pub struct SurfaceClassificationStats {
     pub non_planar: usize,
     pub unknown: usize,
     pub skipped_unchanged: usize,
+    pub immature_fast_path: usize,
 }
 
 /// 成熟した GlobalMap 平面を使って新規観測を更新するための設定。
@@ -668,21 +669,31 @@ impl LOCALMap {
             .unwrap_or_default();
         let unchanged_filter_start = profile_enabled.then(Instant::now);
         let affected_center_count = affected_center_versions.len();
-        let center_keys: Vec<VoxelKey> = affected_center_versions
-            .into_iter()
-            .filter_map(|(key, dirty_frame_id)| {
-                let cell = self.voxel_map.get(&key)?;
-                let config_changed = cell.surface_evaluation_epoch != evaluation_epoch;
-                let has_unseen_update = cell
-                    .surface_evaluated_through_frame_id
-                    .is_none_or(|evaluated_frame_id| evaluated_frame_id < dirty_frame_id);
-                (config_changed || has_unseen_update).then_some(key)
-            })
-            .collect();
+        let mut center_keys = Vec::new();
+        let mut immature_center_keys = Vec::new();
+        for (key, dirty_frame_id) in affected_center_versions {
+            let Some(cell) = self.voxel_map.get(&key) else {
+                continue;
+            };
+            let config_changed = cell.surface_evaluation_epoch != evaluation_epoch;
+            let has_unseen_update = cell
+                .surface_evaluated_through_frame_id
+                .is_none_or(|evaluated_frame_id| evaluated_frame_id < dirty_frame_id);
+            if !config_changed && !has_unseen_update {
+                continue;
+            }
+
+            if cell.observed_frames < filter_config.min_center_observed_frames {
+                immature_center_keys.push(key);
+            } else {
+                center_keys.push(key);
+            }
+        }
         let unchanged_filter_wall = unchanged_filter_start
             .map(|start| start.elapsed())
             .unwrap_or_default();
-        let skipped_unchanged = affected_center_count.saturating_sub(center_keys.len());
+        let scheduled_center_count = center_keys.len() + immature_center_keys.len();
+        let skipped_unchanged = affected_center_count.saturating_sub(scheduled_center_count);
         let (mut stats, timings) = self.classify_surface_voxels(
             &center_keys,
             filter_config,
@@ -690,6 +701,25 @@ impl LOCALMap {
             Some(current_frame_id),
             evaluation_epoch,
         );
+
+        // 中心セル自体が未成熟なら、近傍収集や RANSAC を行っても必ず Unknown になる。
+        // Rayon の評価対象には入れず、結果と評価ウォーターマークだけを更新する。
+        let immature_fast_path_start = profile_enabled.then(Instant::now);
+        for key in immature_center_keys {
+            let Some(cell) = self.voxel_map.get_mut(&key) else {
+                continue;
+            };
+            cell.surface_status = SurfaceStatus::Unknown;
+            cell.surface_plane = None;
+            cell.surface_evaluation_epoch = evaluation_epoch;
+            cell.surface_evaluated_through_frame_id = Some(current_frame_id);
+            stats.evaluated += 1;
+            stats.unknown += 1;
+            stats.immature_fast_path += 1;
+        }
+        let immature_fast_path_wall = immature_fast_path_start
+            .map(|start| start.elapsed())
+            .unwrap_or_default();
         stats.skipped_unchanged = skipped_unchanged;
 
         if profile_enabled {
@@ -703,11 +733,9 @@ impl LOCALMap {
             let wall_overhead = total_wall
                 .saturating_sub(candidate_generation_wall)
                 .saturating_sub(unchanged_filter_wall)
-                .saturating_sub(timings.total_wall);
-            let worker_time_sum = timings.neighborhood_cpu_sum
-                + timings.ransac_cpu_sum
-                + timings.pca_cpu_sum
-                + timings.evaluation_other_cpu_sum;
+                .saturating_sub(timings.total_wall)
+                .saturating_sub(immature_fast_path_wall);
+            let worker_time_sum = timings.evaluation_worker_sum;
             let effective_parallelism = ratio(
                 worker_time_sum.as_secs_f64(),
                 timings.parallel_evaluation_wall.as_secs_f64(),
@@ -732,35 +760,48 @@ impl LOCALMap {
                 "Delayed surface realtime frame={current_frame_id}: \
                  classify_surface_voxels_affected_by wall_ms total={:.3}, \
                  candidate_generation={:.3}, unchanged_filter={:.3}, \
-                 classify_surface_voxels={:.3}, other={:.3} | dirty={}, probes={}, \
-                 affected_centers={}, skipped_unchanged={}, evaluated={}",
+                 classify_surface_voxels={:.3}, immature_fast_path={:.3}, other={:.3} | \
+                 dirty={}, probes={}, affected_centers={}, skipped_unchanged={}, \
+                 immature_fast_path_count={}, evaluated={}",
                 duration_ms(total_wall),
                 duration_ms(candidate_generation_wall),
                 duration_ms(unchanged_filter_wall),
                 duration_ms(timings.total_wall),
+                duration_ms(immature_fast_path_wall),
                 duration_ms(wall_overhead),
                 dirty_versions.len(),
                 candidate_probes,
                 affected_center_count,
                 skipped_unchanged,
+                stats.immature_fast_path,
                 stats.evaluated,
             );
             log::info!(
                 "Delayed surface realtime frame={current_frame_id}: classify_surface_voxels \
                  wall_ms total={:.3}, parallel_evaluation={:.3}, timing_reduce={:.3}, \
-                 result_apply={:.3}, other={:.3} | evaluate_surface_voxel worker_sum_ms \
-                 total={:.3}, neighborhood={:.3}, ransac_plane_inliers={:.3}, \
-                 fit_plane_pca={:.3}, other={:.3} | effective_parallelism={:.2}x",
+                 result_apply={:.3}, other={:.3} | evaluate_surface_voxel worker_estimate_ms \
+                 total={:.3}, center_precheck={:.3}, neighborhood={:.3}, \
+                 insufficient_neighbors={:.3}, ransac_plane_inliers={:.3}, \
+                 post_ransac_gate={:.3}, fit_plane_pca={:.3}, \
+                 rmse_and_quality_check={:.3}, other={:.3} | timing_sample={}/{}, \
+                 scale={:.2}x, estimated_parallelism={:.2}x",
                 duration_ms(timings.total_wall),
                 duration_ms(timings.parallel_evaluation_wall),
                 duration_ms(timings.evaluation_reduce_wall),
                 duration_ms(timings.result_apply_wall),
                 duration_ms(classification_other_wall),
                 duration_ms(worker_time_sum),
+                duration_ms(timings.center_precheck_worker_sum),
                 duration_ms(timings.neighborhood_cpu_sum),
+                duration_ms(timings.insufficient_neighbors_worker_sum),
                 duration_ms(timings.ransac_cpu_sum),
+                duration_ms(timings.post_ransac_gate_worker_sum),
                 duration_ms(timings.pca_cpu_sum),
+                duration_ms(timings.rmse_and_quality_check_worker_sum),
                 duration_ms(timings.evaluation_other_cpu_sum),
+                timings.timing_sample_count,
+                timings.evaluation_count,
+                timings.timing_sample_scale,
                 effective_parallelism,
             );
             log::debug!(
@@ -806,12 +847,14 @@ impl LOCALMap {
                 .map_init(
                     || SurfaceEvaluationScratch::with_capacity(max_neighbor_points),
                     |scratch, key| {
+                        let detailed_profile_enabled =
+                            profile_enabled && should_sample_surface_timing(*key);
                         evaluate_surface_voxel(
                             voxel_map,
                             *key,
                             filter_config,
                             scratch,
-                            profile_enabled,
+                            detailed_profile_enabled,
                         )
                         .map(|evaluation| (*key, evaluation))
                     },
@@ -823,6 +866,7 @@ impl LOCALMap {
             .map(|start| start.elapsed())
             .unwrap_or_default();
 
+        let evaluation_count = evaluations.len();
         let evaluation_reduce_start = profile_enabled.then(Instant::now);
         let evaluation_cpu_sums = evaluations.iter().fold(
             SurfaceEvaluationTimings::default(),
@@ -834,6 +878,10 @@ impl LOCALMap {
         let evaluation_reduce_wall = evaluation_reduce_start
             .map(|start| start.elapsed())
             .unwrap_or_default();
+        let timing_sample_scale = ratio(
+            evaluation_count as f64,
+            evaluation_cpu_sums.timing_samples as f64,
+        );
 
         let result_apply_start = profile_enabled.then(Instant::now);
         let mut stats = SurfaceClassificationStats::default();
@@ -864,10 +912,39 @@ impl LOCALMap {
                 total_wall,
                 parallel_evaluation_wall,
                 evaluation_reduce_wall,
-                neighborhood_cpu_sum: evaluation_cpu_sums.neighborhood,
-                ransac_cpu_sum: evaluation_cpu_sums.ransac,
-                pca_cpu_sum: evaluation_cpu_sums.pca,
-                evaluation_other_cpu_sum: evaluation_cpu_sums.other(),
+                evaluation_worker_sum: scale_duration(
+                    evaluation_cpu_sums.total,
+                    timing_sample_scale,
+                ),
+                center_precheck_worker_sum: scale_duration(
+                    evaluation_cpu_sums.center_precheck,
+                    timing_sample_scale,
+                ),
+                neighborhood_cpu_sum: scale_duration(
+                    evaluation_cpu_sums.neighborhood,
+                    timing_sample_scale,
+                ),
+                insufficient_neighbors_worker_sum: scale_duration(
+                    evaluation_cpu_sums.insufficient_neighbors,
+                    timing_sample_scale,
+                ),
+                ransac_cpu_sum: scale_duration(evaluation_cpu_sums.ransac, timing_sample_scale),
+                post_ransac_gate_worker_sum: scale_duration(
+                    evaluation_cpu_sums.post_ransac_gate,
+                    timing_sample_scale,
+                ),
+                pca_cpu_sum: scale_duration(evaluation_cpu_sums.pca, timing_sample_scale),
+                rmse_and_quality_check_worker_sum: scale_duration(
+                    evaluation_cpu_sums.rmse_and_quality_check,
+                    timing_sample_scale,
+                ),
+                evaluation_other_cpu_sum: scale_duration(
+                    evaluation_cpu_sums.other(),
+                    timing_sample_scale,
+                ),
+                timing_sample_count: evaluation_cpu_sums.timing_samples,
+                evaluation_count,
+                timing_sample_scale,
                 result_apply_wall,
                 ransac_calls: evaluation_cpu_sums.ransac_calls,
                 ransac_draws: evaluation_cpu_sums.ransac_draws,
@@ -919,9 +996,14 @@ struct SurfaceEvaluation {
 #[derive(Debug, Clone, Copy, Default)]
 struct SurfaceEvaluationTimings {
     total: Duration,
+    center_precheck: Duration,
     neighborhood: Duration,
+    insufficient_neighbors: Duration,
     ransac: Duration,
+    post_ransac_gate: Duration,
     pca: Duration,
+    rmse_and_quality_check: Duration,
+    timing_samples: usize,
     ransac_calls: usize,
     ransac_draws: usize,
     ransac_pruned: usize,
@@ -934,9 +1016,14 @@ struct SurfaceEvaluationTimings {
 impl SurfaceEvaluationTimings {
     fn add_assign(&mut self, other: Self) {
         self.total += other.total;
+        self.center_precheck += other.center_precheck;
         self.neighborhood += other.neighborhood;
+        self.insufficient_neighbors += other.insufficient_neighbors;
         self.ransac += other.ransac;
+        self.post_ransac_gate += other.post_ransac_gate;
         self.pca += other.pca;
+        self.rmse_and_quality_check += other.rmse_and_quality_check;
+        self.timing_samples += other.timing_samples;
         self.ransac_calls += other.ransac_calls;
         self.ransac_draws += other.ransac_draws;
         self.ransac_pruned += other.ransac_pruned;
@@ -948,9 +1035,13 @@ impl SurfaceEvaluationTimings {
 
     fn other(self) -> Duration {
         self.total
+            .saturating_sub(self.center_precheck)
             .saturating_sub(self.neighborhood)
+            .saturating_sub(self.insufficient_neighbors)
             .saturating_sub(self.ransac)
+            .saturating_sub(self.post_ransac_gate)
             .saturating_sub(self.pca)
+            .saturating_sub(self.rmse_and_quality_check)
     }
 }
 
@@ -959,10 +1050,18 @@ struct SurfaceClassificationTimings {
     total_wall: Duration,
     parallel_evaluation_wall: Duration,
     evaluation_reduce_wall: Duration,
+    evaluation_worker_sum: Duration,
+    center_precheck_worker_sum: Duration,
     neighborhood_cpu_sum: Duration,
+    insufficient_neighbors_worker_sum: Duration,
     ransac_cpu_sum: Duration,
+    post_ransac_gate_worker_sum: Duration,
     pca_cpu_sum: Duration,
+    rmse_and_quality_check_worker_sum: Duration,
     evaluation_other_cpu_sum: Duration,
+    timing_sample_count: usize,
+    evaluation_count: usize,
+    timing_sample_scale: f64,
     result_apply_wall: Duration,
     ransac_calls: usize,
     ransac_draws: usize,
@@ -987,20 +1086,38 @@ impl SurfaceEvaluationScratch {
     }
 }
 
+/// ボクセル内部の詳細時計測は 1/64 だけで行い、通常処理への観測負荷を抑える。
+/// SplitMix64 のハッシュを使うため、連続した空間キーにも偏りにくい。
+const SURFACE_TIMING_SAMPLE_RATE: usize = 64;
+
+fn should_sample_surface_timing(key: VoxelKey) -> bool {
+    // RANSAC の仮説列とは別の salt を使い、サンプリングと平面推定結果の相関を避ける。
+    let mut sample_state = ransac_seed(key) ^ 0xd1b5_4a32_d192_ed03;
+    next_random_index(&mut sample_state, SURFACE_TIMING_SAMPLE_RATE) == 0
+}
+
 fn evaluate_surface_voxel(
     voxel_map: &VoxelMap,
     center_key: VoxelKey,
     config: &SurfaceFilterConfig,
     scratch: &mut SurfaceEvaluationScratch,
-    profile_enabled: bool,
+    detailed_profile_enabled: bool,
 ) -> Option<SurfaceEvaluation> {
-    let evaluation_start = profile_enabled.then(Instant::now);
+    let evaluation_start = detailed_profile_enabled.then(Instant::now);
     let mut timings = SurfaceEvaluationTimings::default();
+    timings.timing_samples = usize::from(detailed_profile_enabled);
+
+    let center_precheck_start = detailed_profile_enabled.then(Instant::now);
     scratch.neighbor_points.clear();
     scratch.inlier_points.clear();
-
-    let center_cell = voxel_map.get(&center_key)?;
-    if center_cell.observed_frames < config.min_center_observed_frames {
+    let center_cell = voxel_map.get(&center_key);
+    let center_is_immature =
+        center_cell.is_some_and(|cell| cell.observed_frames < config.min_center_observed_frames);
+    timings.center_precheck = center_precheck_start
+        .map(|start| start.elapsed())
+        .unwrap_or_default();
+    let center_cell = center_cell?;
+    if center_is_immature {
         return Some(SurfaceEvaluation {
             status: SurfaceStatus::Unknown,
             plane: None,
@@ -1008,7 +1125,7 @@ fn evaluate_surface_voxel(
         });
     }
 
-    let neighborhood_start = profile_enabled.then(Instant::now);
+    let neighborhood_start = detailed_profile_enabled.then(Instant::now);
     let radius = config.neighbor_radius_voxels.max(0);
     for dz in -radius..=radius {
         for dy in -radius..=radius {
@@ -1028,7 +1145,12 @@ fn evaluate_surface_voxel(
         .map(|start| start.elapsed())
         .unwrap_or_default();
 
-    if scratch.neighbor_points.len() < config.min_neighbors {
+    let insufficient_neighbors_start = detailed_profile_enabled.then(Instant::now);
+    let has_insufficient_neighbors = scratch.neighbor_points.len() < config.min_neighbors;
+    timings.insufficient_neighbors = insufficient_neighbors_start
+        .map(|start| start.elapsed())
+        .unwrap_or_default();
+    if has_insufficient_neighbors {
         return Some(SurfaceEvaluation {
             status: SurfaceStatus::Unknown,
             plane: None,
@@ -1036,7 +1158,7 @@ fn evaluate_surface_voxel(
         });
     }
 
-    let ransac_start = profile_enabled.then(Instant::now);
+    let ransac_start = detailed_profile_enabled.then(Instant::now);
     let ransac_outcome = ransac_plane_inliers(
         &scratch.neighbor_points,
         center_key,
@@ -1049,6 +1171,8 @@ fn evaluate_surface_voxel(
     timings.ransac = ransac_start
         .map(|start| start.elapsed())
         .unwrap_or_default();
+
+    let post_ransac_gate_start = detailed_profile_enabled.then(Instant::now);
     timings.ransac_calls = 1;
     timings.ransac_draws = ransac_outcome.draws;
     timings.ransac_pruned = ransac_outcome.pruned_hypotheses;
@@ -1056,18 +1180,14 @@ fn evaluate_surface_voxel(
     timings.ransac_point_tests_skipped = ransac_outcome.point_tests_skipped;
     timings.ransac_adaptive_stops = usize::from(ransac_outcome.adaptive_stopped);
     timings.ransac_iterations_saved = ransac_outcome.iterations_saved;
-    if !ransac_outcome.found {
-        return Some(SurfaceEvaluation {
-            status: SurfaceStatus::NonPlanar,
-            plane: None,
-            timings: finish_evaluation_timing(timings, evaluation_start),
-        });
-    }
-
     let inlier_ratio = scratch.inlier_points.len() as f32 / scratch.neighbor_points.len() as f32;
-    if scratch.inlier_points.len() < config.min_ransac_inliers
-        || inlier_ratio < config.min_inlier_ratio
-    {
+    let rejected_by_ransac_gate = !ransac_outcome.found
+        || scratch.inlier_points.len() < config.min_ransac_inliers
+        || inlier_ratio < config.min_inlier_ratio;
+    timings.post_ransac_gate = post_ransac_gate_start
+        .map(|start| start.elapsed())
+        .unwrap_or_default();
+    if rejected_by_ransac_gate {
         return Some(SurfaceEvaluation {
             status: SurfaceStatus::NonPlanar,
             plane: None,
@@ -1076,10 +1196,15 @@ fn evaluate_surface_voxel(
     }
 
     // RANSAC で外れ値を除去した後の PCA は、この1回だけ実施する。
-    let pca_start = profile_enabled.then(Instant::now);
+    let pca_start = detailed_profile_enabled.then(Instant::now);
     let fitted_plane = fit_plane(&scratch.inlier_points);
     timings.pca = pca_start.map(|start| start.elapsed()).unwrap_or_default();
+
+    let rmse_and_quality_check_start = detailed_profile_enabled.then(Instant::now);
     let Some(fitted_plane) = fitted_plane else {
+        timings.rmse_and_quality_check = rmse_and_quality_check_start
+            .map(|start| start.elapsed())
+            .unwrap_or_default();
         return Some(SurfaceEvaluation {
             status: SurfaceStatus::NonPlanar,
             plane: None,
@@ -1109,6 +1234,9 @@ fn evaluate_surface_voxel(
         neighbor_count: scratch.neighbor_points.len(),
         inlier_count: scratch.inlier_points.len(),
     });
+    timings.rmse_and_quality_check = rmse_and_quality_check_start
+        .map(|start| start.elapsed())
+        .unwrap_or_default();
 
     Some(SurfaceEvaluation {
         status: if is_planar {
@@ -1133,6 +1261,14 @@ fn finish_evaluation_timing(
 
 fn duration_ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
+}
+
+fn scale_duration(duration: Duration, scale: f64) -> Duration {
+    if scale <= 0.0 || !scale.is_finite() {
+        return Duration::default();
+    }
+
+    Duration::from_secs_f64(duration.as_secs_f64() * scale)
 }
 
 fn ratio(numerator: f64, denominator: f64) -> f64 {
@@ -1709,6 +1845,29 @@ mod tests {
     }
 
     #[test]
+    fn surface_timing_sampling_is_deterministic_and_sparse() {
+        let keys: Vec<VoxelKey> = (0..4096)
+            .map(|ix| VoxelKey {
+                ix,
+                iy: ix.wrapping_mul(17),
+                iz: ix.wrapping_mul(-31),
+            })
+            .collect();
+        let first: Vec<bool> = keys
+            .iter()
+            .map(|key| should_sample_surface_timing(*key))
+            .collect();
+        let second: Vec<bool> = keys
+            .iter()
+            .map(|key| should_sample_surface_timing(*key))
+            .collect();
+        let sampled = first.iter().filter(|sampled| **sampled).count();
+
+        assert_eq!(first, second);
+        assert!((32..=96).contains(&sampled), "sampled={sampled}");
+    }
+
+    #[test]
     fn adaptive_ransac_limit_uses_best_inlier_ratio() {
         assert_eq!(adaptive_ransac_iteration_limit(50, 100, 0.999, 8, 48), 48);
         assert_eq!(adaptive_ransac_iteration_limit(60, 100, 0.999, 8, 48), 29);
@@ -1865,6 +2024,35 @@ mod tests {
         let stats = map.classify_delayed_surface_voxels(2, &changed_config);
         assert_eq!(stats.evaluated, 1);
         assert_eq!(stats.skipped_unchanged, 0);
+    }
+
+    #[test]
+    fn delayed_classification_handles_immature_center_without_parallel_evaluation() {
+        let mut map = LOCALMap::new(map_config());
+        let pose = Matrix4::<f64>::identity();
+        let filter_config = surface_filter_config();
+
+        // 各フレームを互いの近傍半径外へ配置し、frame 0 の中心を observed_frames=1 の
+        // 未成熟セルとして遅延判定へ渡す。
+        map.update_world_map(&[Point3::new(0.01, 0.01, 0.01)], &pose);
+        map.update_world_map(&[Point3::new(1.01, 0.01, 0.01)], &pose);
+        map.update_world_map(&[Point3::new(2.01, 0.01, 0.01)], &pose);
+
+        let stats = map.classify_delayed_surface_voxels(2, &filter_config);
+        assert_eq!(stats.evaluated, 1);
+        assert_eq!(stats.unknown, 1);
+        assert_eq!(stats.immature_fast_path, 1);
+
+        let cell = map
+            .voxel_map
+            .get(&VoxelKey {
+                ix: 0,
+                iy: 0,
+                iz: 0,
+            })
+            .unwrap();
+        assert_eq!(cell.surface_status, SurfaceStatus::Unknown);
+        assert_eq!(cell.surface_evaluated_through_frame_id, Some(2));
     }
 
     #[test]
