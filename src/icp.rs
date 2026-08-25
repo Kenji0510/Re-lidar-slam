@@ -69,7 +69,7 @@ pub fn build_robust_point_to_plane_system(
 ) -> IcpLinearSystem {
     type Accum = (Matrix6f, Vector6f, f32, usize);
 
-    let (h, b, cost, used_count) = correspondences
+    let (mut h, b, cost, used_count) = correspondences
         .par_iter()
         .fold(
             || (Matrix6f::zeros(), Vector6f::zeros(), 0.0f32, 0usize),
@@ -78,22 +78,21 @@ pub fn build_robust_point_to_plane_system(
                 let transformed = rp + t_vec;
 
                 let residual = corr.plane_normal.dot(&transformed) + corr.plane_d;
-                let weight = huber_weight(residual, huber_delta_m);
+                let (weight, loss) = huber_weight_and_loss(residual, huber_delta_m);
 
                 let j_rot = rp.cross(&corr.plane_normal);
                 let j_trans = corr.plane_normal;
+                let j = [j_rot.x, j_rot.y, j_rot.z, j_trans.x, j_trans.y, j_trans.z];
 
-                let mut j = Vector6f::zeros();
-                j[0] = j_rot.x;
-                j[1] = j_rot.y;
-                j[2] = j_rot.z;
-                j[3] = j_trans.x;
-                j[4] = j_trans.y;
-                j[5] = j_trans.z;
-
-                h += weight * (j * j.transpose());
-                b -= weight * j * residual;
-                cost += huber_loss(residual, huber_delta_m);
+                // H は対称なので上三角21要素だけを直接累積する。
+                // 汎用の 6x1 * 1x6 外積と一時行列の生成を避ける。
+                for row in 0..6 {
+                    b[row] -= weight * j[row] * residual;
+                    for col in row..6 {
+                        h[(row, col)] += weight * j[row] * j[col];
+                    }
+                }
+                cost += loss;
                 cnt += 1;
                 (h, b, cost, cnt)
             },
@@ -102,6 +101,12 @@ pub fn build_robust_point_to_plane_system(
             || (Matrix6f::zeros(), Vector6f::zeros(), 0.0f32, 0usize),
             |(h1, b1, c1, n1): Accum, (h2, b2, c2, n2): Accum| (h1 + h2, b1 + b2, c1 + c2, n1 + n2),
         );
+
+    for row in 1..6 {
+        for col in 0..row {
+            h[(row, col)] = h[(col, row)];
+        }
+    }
 
     IcpLinearSystem {
         h,
@@ -112,27 +117,23 @@ pub fn build_robust_point_to_plane_system(
 }
 
 #[inline]
-fn huber_weight(residual: f32, delta: f32) -> f32 {
+fn huber_weight_and_loss(residual: f32, delta: f32) -> (f32, f32) {
     let abs_residual = residual.abs();
     if !delta.is_finite() || abs_residual <= delta {
-        1.0
+        (1.0, residual * residual)
     } else if delta > 0.0 && abs_residual.is_finite() {
-        delta / abs_residual.max(f32::EPSILON)
+        (
+            delta / abs_residual.max(f32::EPSILON),
+            2.0 * delta * abs_residual - delta * delta,
+        )
     } else {
-        0.0
+        (0.0, f32::INFINITY)
     }
 }
 
 #[inline]
 fn huber_loss(residual: f32, delta: f32) -> f32 {
-    let abs_residual = residual.abs();
-    if !delta.is_finite() || abs_residual <= delta {
-        residual * residual
-    } else if delta > 0.0 && abs_residual.is_finite() {
-        2.0 * delta * abs_residual - delta * delta
-    } else {
-        f32::INFINITY
-    }
+    huber_weight_and_loss(residual, delta).1
 }
 
 /// 線形システムを解いて pose 差分 δ = [δθ; δt] を返す。
@@ -311,6 +312,42 @@ pub fn compute_robust_cost(
 mod tests {
     use super::*;
 
+    fn build_reference_robust_system(
+        correspondences: &[PointCorrespondence],
+        r_mat: &Matrix3<f32>,
+        t_vec: &Vector3<f32>,
+        huber_delta_m: f32,
+    ) -> IcpLinearSystem {
+        let mut system = IcpLinearSystem::default();
+        for corr in correspondences {
+            let rp = r_mat * corr.src_point.coords;
+            let residual = corr.plane_normal.dot(&(rp + t_vec)) + corr.plane_d;
+            let (weight, loss) = huber_weight_and_loss(residual, huber_delta_m);
+            let j_rot = rp.cross(&corr.plane_normal);
+            let j = Vector6f::new(
+                j_rot.x,
+                j_rot.y,
+                j_rot.z,
+                corr.plane_normal.x,
+                corr.plane_normal.y,
+                corr.plane_normal.z,
+            );
+            system.h += weight * (j * j.transpose());
+            system.b -= weight * j * residual;
+            system.cost += loss;
+            system.used_count += 1;
+        }
+        system
+    }
+
+    fn assert_close(actual: f32, expected: f32) {
+        let tolerance = 2e-5 * expected.abs().max(1.0);
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "actual={actual}, expected={expected}, tolerance={tolerance}",
+        );
+    }
+
     fn diagonal_system(diagonal: [f32; 6], b: [f32; 6]) -> IcpLinearSystem {
         let mut h = Matrix6f::zeros();
         for (index, value) in diagonal.into_iter().enumerate() {
@@ -414,8 +451,47 @@ mod tests {
 
     #[test]
     fn huber_weight_limits_large_outliers() {
-        assert_eq!(huber_weight(0.05, 0.1), 1.0);
-        assert!((huber_weight(1.0, 0.1) - 0.1).abs() < 1e-6);
+        assert_eq!(huber_weight_and_loss(0.05, 0.1).0, 1.0);
+        assert!((huber_weight_and_loss(1.0, 0.1).0 - 0.1).abs() < 1e-6);
         assert!(huber_loss(1.0, 0.1) < 0.5);
+    }
+
+    #[test]
+    fn triangular_accumulation_matches_full_outer_product() {
+        let correspondences: Vec<_> = (0..257)
+            .map(|index| {
+                let phase = index as f32 * 0.037;
+                let raw_normal = Vector3::new(
+                    0.3 + phase.sin().abs(),
+                    0.4 + (phase * 1.7).cos().abs(),
+                    0.5 + (phase * 0.7).sin().abs(),
+                );
+                PointCorrespondence {
+                    src_point: nalgebra::Point3::new(
+                        phase.sin() * 8.0,
+                        phase.cos() * 5.0,
+                        phase * 0.2 - 1.0,
+                    ),
+                    plane_normal: raw_normal.normalize(),
+                    plane_d: (phase * 0.3).sin() * 0.2,
+                }
+            })
+            .collect();
+        let r_mat = UnitQuaternion::from_euler_angles(0.08, -0.04, 0.12)
+            .to_rotation_matrix()
+            .into_inner();
+        let t_vec = Vector3::new(0.13, -0.07, 0.04);
+
+        let actual = build_robust_point_to_plane_system(&correspondences, &r_mat, &t_vec, 0.08);
+        let expected = build_reference_robust_system(&correspondences, &r_mat, &t_vec, 0.08);
+
+        assert_eq!(actual.used_count, expected.used_count);
+        assert_close(actual.cost, expected.cost);
+        for (actual, expected) in actual.h.iter().zip(expected.h.iter()) {
+            assert_close(*actual, *expected);
+        }
+        for (actual, expected) in actual.b.iter().zip(expected.b.iter()) {
+            assert_close(*actual, *expected);
+        }
     }
 }
