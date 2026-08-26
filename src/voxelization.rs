@@ -65,8 +65,74 @@ pub fn voxel_downsample_points(points: &[Point3<f32>], voxel_size: f32) -> Vec<P
     assert!(voxel_size > 0.0, "voxel_size must be positive");
 
     let inv_voxel = 1.0 / voxel_size;
+    let (min_corner, max_corner) = point_cloud_bounds(points);
+    warn_if_morton_extent_exceeded(&min_corner, &max_corner, inv_voxel);
 
-    let (min_corner, max_corner) = points
+    let global_map = build_stat_map(points, &min_corner, inv_voxel);
+    stat_map_into_centroids(global_map)
+}
+
+/// Downsample the same point cloud at two resolutions in one parallel pass.
+///
+/// Each resolution keeps an independent accumulator, so voxel membership and
+/// centroid calculation are identical to two calls to [`voxel_downsample_points`].
+/// The point-cloud bounds calculation and Rayon traversal are shared.
+pub fn voxel_downsample_points_dual(
+    points: &[Point3<f32>],
+    first_voxel_size: f32,
+    second_voxel_size: f32,
+) -> (Vec<Point3<f32>>, Vec<Point3<f32>>) {
+    if points.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    assert!(first_voxel_size > 0.0, "voxel_size must be positive");
+    assert!(second_voxel_size > 0.0, "voxel_size must be positive");
+
+    let first_inv_voxel = 1.0 / first_voxel_size;
+    let second_inv_voxel = 1.0 / second_voxel_size;
+    let (min_corner, max_corner) = point_cloud_bounds(points);
+
+    warn_if_morton_extent_exceeded(&min_corner, &max_corner, first_inv_voxel);
+    warn_if_morton_extent_exceeded(&min_corner, &max_corner, second_inv_voxel);
+
+    let (first_map, second_map) = points
+        .par_iter()
+        .fold(
+            || {
+                (
+                    FastMap::<VoxelStat>::default(),
+                    FastMap::<VoxelStat>::default(),
+                )
+            },
+            |(mut first_map, mut second_map), point| {
+                add_point_to_map(&mut first_map, point, &min_corner, first_inv_voxel);
+                add_point_to_map(&mut second_map, point, &min_corner, second_inv_voxel);
+                (first_map, second_map)
+            },
+        )
+        .reduce(
+            || {
+                (
+                    FastMap::<VoxelStat>::default(),
+                    FastMap::<VoxelStat>::default(),
+                )
+            },
+            |(mut first_a, mut second_a), (first_b, second_b)| {
+                merge_stat_maps(&mut first_a, first_b);
+                merge_stat_maps(&mut second_a, second_b);
+                (first_a, second_a)
+            },
+        );
+
+    (
+        stat_map_into_centroids(first_map),
+        stat_map_into_centroids(second_map),
+    )
+}
+
+fn point_cloud_bounds(points: &[Point3<f32>]) -> (Vector3<f32>, Vector3<f32>) {
+    points
         .par_iter()
         .fold(
             || {
@@ -108,8 +174,14 @@ pub fn voxel_downsample_points(points: &[Point3<f32>], voxel_size: f32) -> Vec<P
                     ),
                 )
             },
-        );
+        )
+}
 
+fn warn_if_morton_extent_exceeded(
+    min_corner: &Vector3<f32>,
+    max_corner: &Vector3<f32>,
+    inv_voxel: f32,
+) {
     let max_idx_x = ((max_corner.x - min_corner.x) * inv_voxel).floor() as u64;
     let max_idx_y = ((max_corner.y - min_corner.y) * inv_voxel).floor() as u64;
     let max_idx_z = ((max_corner.z - min_corner.z) * inv_voxel).floor() as u64;
@@ -119,34 +191,109 @@ pub fn voxel_downsample_points(points: &[Point3<f32>], voxel_size: f32) -> Vec<P
             "Warning: point cloud extent exceeds Morton code 21-bit limit. Key collision may occur."
         );
     }
+}
 
-    let global_map: FastMap<VoxelStat> = points
+fn build_stat_map(
+    points: &[Point3<f32>],
+    min_corner: &Vector3<f32>,
+    inv_voxel: f32,
+) -> FastMap<VoxelStat> {
+    points
         .par_iter()
-        .fold(FastMap::<VoxelStat>::default, |mut local_map, p| {
-            let ix = ((p.x - min_corner.x) * inv_voxel).floor().max(0.0) as u32;
-            let iy = ((p.y - min_corner.y) * inv_voxel).floor().max(0.0) as u32;
-            let iz = ((p.z - min_corner.z) * inv_voxel).floor().max(0.0) as u32;
-
-            let key = morton3d(ix, iy, iz);
-
-            local_map.entry(key).or_default().add_point(p);
-
+        .fold(FastMap::<VoxelStat>::default, |mut local_map, point| {
+            add_point_to_map(&mut local_map, point, min_corner, inv_voxel);
             local_map
         })
         .reduce(FastMap::<VoxelStat>::default, |mut map_a, map_b| {
-            for (key, stat_b) in map_b {
-                map_a.entry(key).or_default().merge(&stat_b);
-            }
+            merge_stat_maps(&mut map_a, map_b);
             map_a
-        });
+        })
+}
 
+#[inline]
+fn add_point_to_map(
+    map: &mut FastMap<VoxelStat>,
+    point: &Point3<f32>,
+    min_corner: &Vector3<f32>,
+    inv_voxel: f32,
+) {
+    let ix = ((point.x - min_corner.x) * inv_voxel).floor().max(0.0) as u32;
+    let iy = ((point.y - min_corner.y) * inv_voxel).floor().max(0.0) as u32;
+    let iz = ((point.z - min_corner.z) * inv_voxel).floor().max(0.0) as u32;
+
+    let key = morton3d(ix, iy, iz);
+    map.entry(key).or_default().add_point(point);
+}
+
+fn merge_stat_maps(map_a: &mut FastMap<VoxelStat>, map_b: FastMap<VoxelStat>) {
+    for (key, stat_b) in map_b {
+        map_a.entry(key).or_default().merge(&stat_b);
+    }
+}
+
+fn stat_map_into_centroids(global_map: FastMap<VoxelStat>) -> Vec<Point3<f32>> {
     let mut result = Vec::with_capacity(global_map.len());
 
-    for stat in global_map.values() {
+    for stat in global_map.into_values() {
         if stat.count > 0 {
             result.push(stat.centroid());
         }
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{voxel_downsample_points, voxel_downsample_points_dual};
+    use nalgebra::Point3;
+
+    fn sort_points(points: &mut [Point3<f32>]) {
+        points.sort_unstable_by(|left, right| {
+            left.x
+                .total_cmp(&right.x)
+                .then_with(|| left.y.total_cmp(&right.y))
+                .then_with(|| left.z.total_cmp(&right.z))
+        });
+    }
+
+    fn assert_same_points(mut actual: Vec<Point3<f32>>, mut expected: Vec<Point3<f32>>) {
+        sort_points(&mut actual);
+        sort_points(&mut expected);
+        assert_eq!(actual.len(), expected.len());
+
+        for (actual, expected) in actual.iter().zip(expected.iter()) {
+            assert!((actual.x - expected.x).abs() <= 1.0e-6);
+            assert!((actual.y - expected.y).abs() <= 1.0e-6);
+            assert!((actual.z - expected.z).abs() <= 1.0e-6);
+        }
+    }
+
+    #[test]
+    fn dual_downsample_matches_independent_downsamples() {
+        let points: Vec<Point3<f32>> = (0..10_000)
+            .map(|index| {
+                let index = index as f32;
+                Point3::new(
+                    (index * 0.137).sin() * 40.0,
+                    (index * 0.071).cos() * 25.0,
+                    (index % 97.0) * 0.031 - 1.5,
+                )
+            })
+            .collect();
+
+        let expected_first = voxel_downsample_points(&points, 0.25);
+        let expected_second = voxel_downsample_points(&points, 0.05);
+        let (actual_first, actual_second) = voxel_downsample_points_dual(&points, 0.25, 0.05);
+
+        assert_same_points(actual_first, expected_first);
+        assert_same_points(actual_second, expected_second);
+    }
+
+    #[test]
+    fn dual_downsample_handles_empty_input() {
+        let (first, second) = voxel_downsample_points_dual(&[], 0.25, 0.05);
+        assert!(first.is_empty());
+        assert!(second.is_empty());
+    }
 }

@@ -14,7 +14,7 @@ use re_lidar_slam::{
         LOCALMap, LocalMapConfig, SurfaceFilterConfig, SurfaceStatus, WorldMapUpdateFilterConfig,
         build_voxel_map,
     },
-    voxelization::voxel_downsample_points,
+    voxelization::{voxel_downsample_points, voxel_downsample_points_dual},
 };
 use std::{
     ffi::OsString,
@@ -391,10 +391,12 @@ fn main() -> Result<()> {
 
         // --- Downsample deskewed points ---
         let voxel_start = Instant::now();
-        let downsampled_source_points_for_local =
-            voxel_downsample_points(&deskewed_points, DOWNSAMPLE_VOXEL_SIZE);
-        let downsampled_source_points_for_global =
-            voxel_downsample_points(&deskewed_points, GLOBAL_MAP_VOXEL_SIZE);
+        let (downsampled_source_points_for_local, downsampled_source_points_for_global) =
+            voxel_downsample_points_dual(
+                &deskewed_points,
+                DOWNSAMPLE_VOXEL_SIZE,
+                GLOBAL_MAP_VOXEL_SIZE,
+            );
         let voxel_end = voxel_start.elapsed();
         log::debug!(
             "Frame {i}: Downsampled {} points → {} points in {:.2?}",
