@@ -1,3 +1,4 @@
+use crate::voxel_map::{VoxelCell, VoxelMap, voxel_key};
 use nalgebra::{Point3, Vector3};
 use nohash_hasher::IntMap;
 use rayon::prelude::*;
@@ -8,6 +9,11 @@ type FastMap<V> = IntMap<u64, V>;
 struct VoxelStat {
     sum: Vector3<f32>,
     count: usize,
+}
+
+pub struct DownsampledPointCloud {
+    pub points: Vec<Point3<f32>>,
+    pub voxel_map: VoxelMap,
 }
 
 impl Default for VoxelStat {
@@ -46,8 +52,8 @@ fn morton3d(ix: u32, iy: u32, iz: u32) -> u64 {
     #[inline]
     fn part1by2(n: u32) -> u64 {
         let mut x = n as u64 & 0x1f_ffff; // 21 bit
-        x = (x | (x << 32)) & 0x1f00_0000_00ff_ff;
-        x = (x | (x << 16)) & 0x1f00_00ff_0000_ff;
+        x = (x | (x << 32)) & 0x001f_0000_0000_ffff;
+        x = (x | (x << 16)) & 0x001f_0000_ff00_00ff;
         x = (x | (x << 8)) & 0x100f_00f0_0f00_f00f;
         x = (x | (x << 4)) & 0x10c3_0c30_c30c_30c3;
         x = (x | (x << 2)) & 0x1249_2492_4924_9249;
@@ -96,38 +102,55 @@ pub fn voxel_downsample_points_dual(
     warn_if_morton_extent_exceeded(&min_corner, &max_corner, first_inv_voxel);
     warn_if_morton_extent_exceeded(&min_corner, &max_corner, second_inv_voxel);
 
-    let (first_map, second_map) = points
-        .par_iter()
-        .fold(
-            || {
-                (
-                    FastMap::<VoxelStat>::default(),
-                    FastMap::<VoxelStat>::default(),
-                )
-            },
-            |(mut first_map, mut second_map), point| {
-                add_point_to_map(&mut first_map, point, &min_corner, first_inv_voxel);
-                add_point_to_map(&mut second_map, point, &min_corner, second_inv_voxel);
-                (first_map, second_map)
-            },
-        )
-        .reduce(
-            || {
-                (
-                    FastMap::<VoxelStat>::default(),
-                    FastMap::<VoxelStat>::default(),
-                )
-            },
-            |(mut first_a, mut second_a), (first_b, second_b)| {
-                merge_stat_maps(&mut first_a, first_b);
-                merge_stat_maps(&mut second_a, second_b);
-                (first_a, second_a)
-            },
-        );
+    let (first_map, second_map) =
+        build_dual_stat_maps(points, &min_corner, first_inv_voxel, second_inv_voxel);
 
     (
         stat_map_into_centroids(first_map),
         stat_map_into_centroids(second_map),
+    )
+}
+
+/// Downsample at two resolutions and build the corresponding source voxel maps.
+///
+/// The maps are populated while the centroid vectors are emitted, preserving
+/// the insertion and representative-point selection performed by
+/// `build_voxel_map(points, voxel_size, _, false)` without hashing the vectors
+/// in a separate pass.
+pub fn voxel_downsample_points_and_maps_dual(
+    points: &[Point3<f32>],
+    first_voxel_size: f32,
+    second_voxel_size: f32,
+) -> (DownsampledPointCloud, DownsampledPointCloud) {
+    if points.is_empty() {
+        return (
+            DownsampledPointCloud {
+                points: Vec::new(),
+                voxel_map: VoxelMap::default(),
+            },
+            DownsampledPointCloud {
+                points: Vec::new(),
+                voxel_map: VoxelMap::default(),
+            },
+        );
+    }
+
+    assert!(first_voxel_size > 0.0, "voxel_size must be positive");
+    assert!(second_voxel_size > 0.0, "voxel_size must be positive");
+
+    let first_inv_voxel = 1.0 / first_voxel_size;
+    let second_inv_voxel = 1.0 / second_voxel_size;
+    let (min_corner, max_corner) = point_cloud_bounds(points);
+
+    warn_if_morton_extent_exceeded(&min_corner, &max_corner, first_inv_voxel);
+    warn_if_morton_extent_exceeded(&min_corner, &max_corner, second_inv_voxel);
+
+    let (first_map, second_map) =
+        build_dual_stat_maps(points, &min_corner, first_inv_voxel, second_inv_voxel);
+
+    (
+        stat_map_into_point_cloud(first_map, first_voxel_size),
+        stat_map_into_point_cloud(second_map, second_voxel_size),
     )
 }
 
@@ -210,6 +233,42 @@ fn build_stat_map(
         })
 }
 
+fn build_dual_stat_maps(
+    points: &[Point3<f32>],
+    min_corner: &Vector3<f32>,
+    first_inv_voxel: f32,
+    second_inv_voxel: f32,
+) -> (FastMap<VoxelStat>, FastMap<VoxelStat>) {
+    points
+        .par_iter()
+        .fold(
+            || {
+                (
+                    FastMap::<VoxelStat>::default(),
+                    FastMap::<VoxelStat>::default(),
+                )
+            },
+            |(mut first_map, mut second_map), point| {
+                add_point_to_map(&mut first_map, point, min_corner, first_inv_voxel);
+                add_point_to_map(&mut second_map, point, min_corner, second_inv_voxel);
+                (first_map, second_map)
+            },
+        )
+        .reduce(
+            || {
+                (
+                    FastMap::<VoxelStat>::default(),
+                    FastMap::<VoxelStat>::default(),
+                )
+            },
+            |(mut first_a, mut second_a), (first_b, second_b)| {
+                merge_stat_maps(&mut first_a, first_b);
+                merge_stat_maps(&mut second_a, second_b);
+                (first_a, second_a)
+            },
+        )
+}
+
 #[inline]
 fn add_point_to_map(
     map: &mut FastMap<VoxelStat>,
@@ -243,9 +302,38 @@ fn stat_map_into_centroids(global_map: FastMap<VoxelStat>) -> Vec<Point3<f32>> {
     result
 }
 
+fn stat_map_into_point_cloud(
+    global_map: FastMap<VoxelStat>,
+    voxel_size: f32,
+) -> DownsampledPointCloud {
+    let mut points = Vec::with_capacity(global_map.len());
+    let mut voxel_map = VoxelMap::default();
+    voxel_map.reserve(global_map.len());
+
+    for stat in global_map.into_values() {
+        if stat.count == 0 {
+            continue;
+        }
+
+        let point = stat.centroid();
+        points.push(point);
+
+        let key = voxel_key(&point, voxel_size);
+        voxel_map
+            .entry(key)
+            .or_insert_with(|| VoxelCell::from_key(&key, voxel_size, point, 0));
+    }
+
+    DownsampledPointCloud { points, voxel_map }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{voxel_downsample_points, voxel_downsample_points_dual};
+    use super::{
+        voxel_downsample_points, voxel_downsample_points_and_maps_dual,
+        voxel_downsample_points_dual,
+    };
+    use crate::voxel_map::build_voxel_map;
     use nalgebra::Point3;
 
     fn sort_points(points: &mut [Point3<f32>]) {
@@ -295,5 +383,46 @@ mod tests {
         let (first, second) = voxel_downsample_points_dual(&[], 0.25, 0.05);
         assert!(first.is_empty());
         assert!(second.is_empty());
+    }
+
+    #[test]
+    fn dual_downsample_maps_match_separate_map_builds() {
+        let points: Vec<Point3<f32>> = (0..10_000)
+            .map(|index| {
+                let index = index as f32;
+                Point3::new(
+                    (index * 0.137).sin() * 40.0,
+                    (index * 0.071).cos() * 25.0,
+                    (index % 97.0) * 0.031 - 1.5,
+                )
+            })
+            .collect();
+
+        let (first, second) = voxel_downsample_points_and_maps_dual(&points, 0.25, 0.05);
+        let expected_first_map = build_voxel_map(&first.points, 0.25, 0, false);
+        let expected_second_map = build_voxel_map(&second.points, 0.05, 0, false);
+
+        assert_eq!(first.voxel_map.len(), expected_first_map.len());
+        assert_eq!(second.voxel_map.len(), expected_second_map.len());
+
+        for (key, expected) in expected_first_map {
+            let actual = first.voxel_map.get(&key).unwrap();
+            assert_eq!(actual.point.0, expected.point.0);
+            assert_eq!(actual.mean, expected.mean);
+        }
+        for (key, expected) in expected_second_map {
+            let actual = second.voxel_map.get(&key).unwrap();
+            assert_eq!(actual.point.0, expected.point.0);
+            assert_eq!(actual.mean, expected.mean);
+        }
+    }
+
+    #[test]
+    fn dual_downsample_maps_handle_empty_input() {
+        let (first, second) = voxel_downsample_points_and_maps_dual(&[], 0.25, 0.05);
+        assert!(first.points.is_empty());
+        assert!(first.voxel_map.is_empty());
+        assert!(second.points.is_empty());
+        assert!(second.voxel_map.is_empty());
     }
 }

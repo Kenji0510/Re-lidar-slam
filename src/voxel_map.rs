@@ -201,18 +201,26 @@ pub struct LOCALMap {
     pub config: LocalMapConfig,
     pub next_frame_id: u64,
     pending_voxel_map: FxHashMap<VoxelKey, PendingVoxelCell>,
+    frame_voxel_scratch: FxHashMap<VoxelKey, (Vector3<f32>, usize)>,
     surface_filter_config: Option<SurfaceFilterConfig>,
     surface_evaluation_epoch: u64,
 }
 
 impl LOCALMap {
     pub fn new(config: LocalMapConfig) -> Self {
+        Self::with_voxel_capacity(config, 0)
+    }
+
+    pub fn with_voxel_capacity(config: LocalMapConfig, voxel_capacity: usize) -> Self {
+        let mut voxel_map = VoxelMap::default();
+        voxel_map.reserve(voxel_capacity);
         Self {
-            voxel_map: VoxelMap::default(),
+            voxel_map,
             frame_index: VecDeque::new(),
             config,
             next_frame_id: 0,
             pending_voxel_map: FxHashMap::default(),
+            frame_voxel_scratch: FxHashMap::default(),
             surface_filter_config: None,
             surface_evaluation_epoch: 0,
         }
@@ -245,24 +253,23 @@ impl LOCALMap {
         origin: Point3<f32>,
     ) -> FrameEntry {
         let voxel_size = self.config.index_voxel_size;
-        let frame_id = self.next_frame_id;
-
-        let mut frame_voxels: FxHashMap<VoxelKey, (Vector3<f32>, usize)> = FxHashMap::default();
+        let mut frame_voxels = std::mem::take(&mut self.frame_voxel_scratch);
+        frame_voxels.clear();
 
         for point in world_points {
-            if !point.coords.iter().all(|value| value.is_finite()) {
-                continue;
-            }
-
-            let key = voxel_key(point, voxel_size);
-            frame_voxels
-                .entry(key)
-                .and_modify(|(sum, count)| {
-                    *sum += point.coords;
-                    *count += 1;
-                })
-                .or_insert((point.coords, 1));
+            accumulate_frame_voxel(&mut frame_voxels, *point, voxel_size);
         }
+
+        self.insert_frame_voxels(frame_voxels, origin)
+    }
+
+    fn insert_frame_voxels(
+        &mut self,
+        mut frame_voxels: FxHashMap<VoxelKey, (Vector3<f32>, usize)>,
+        origin: Point3<f32>,
+    ) -> FrameEntry {
+        let voxel_size = self.config.index_voxel_size;
+        let frame_id = self.next_frame_id;
 
         // VoxelMap への挿入は順次（排他アクセスが必要）
         // for (key, p_world) in world_pts {
@@ -284,7 +291,7 @@ impl LOCALMap {
         let min_samples = self.config.min_points_per_voxel;
         let dirty_keys = frame_voxels.keys().copied().collect();
 
-        for (key, (sum, count)) in frame_voxels {
+        for (key, (sum, count)) in frame_voxels.drain() {
             let frame_mean = Point3::from(sum / count as f32);
 
             match self.voxel_map.entry(key) {
@@ -301,6 +308,7 @@ impl LOCALMap {
                 }
             }
         }
+        self.frame_voxel_scratch = frame_voxels;
 
         self.next_frame_id += 1;
 
@@ -377,31 +385,31 @@ impl LOCALMap {
             input_points: source_points.len(),
             ..WorldMapUpdateStats::default()
         };
-        let mut accepted_world_points = Vec::with_capacity(source_points.len());
+        let voxel_size = self.config.index_voxel_size;
+        let mut accepted_frame_voxels = std::mem::take(&mut self.frame_voxel_scratch);
+        accepted_frame_voxels.clear();
         let mut pending_frame_voxels: FxHashMap<VoxelKey, (Vector3<f32>, usize)> =
             FxHashMap::default();
 
         for decision in decisions {
             match decision {
                 WorldPointUpdateDecision::InsertProvisional(point) => {
-                    accepted_world_points.push(point);
+                    accumulate_frame_voxel(&mut accepted_frame_voxels, point, voxel_size);
                     self.pending_voxel_map
-                        .remove(&voxel_key(&point, self.config.index_voxel_size));
+                        .remove(&voxel_key(&point, voxel_size));
                     stats.inserted_provisional += 1;
                 }
                 WorldPointUpdateDecision::InsertOnMaturePlane {
                     original,
                     insertion,
                 } => {
-                    accepted_world_points.push(insertion);
-                    self.pending_voxel_map.remove(&voxel_key(
-                        &original,
-                        self.config.index_voxel_size,
-                    ));
+                    accumulate_frame_voxel(&mut accepted_frame_voxels, insertion, voxel_size);
+                    self.pending_voxel_map
+                        .remove(&voxel_key(&original, voxel_size));
                     stats.projected_to_mature_plane += 1;
                 }
                 WorldPointUpdateDecision::HoldPending(point) => {
-                    let key = voxel_key(&point, self.config.index_voxel_size);
+                    let key = voxel_key(&point, voxel_size);
                     pending_frame_voxels
                         .entry(key)
                         .and_modify(|(sum, count)| {
@@ -416,7 +424,6 @@ impl LOCALMap {
                 }
             }
         }
-
         for (key, (sum, count)) in pending_frame_voxels {
             let frame_mean = Point3::from(sum / count as f32);
             match self.pending_voxel_map.entry(key) {
@@ -428,8 +435,7 @@ impl LOCALMap {
                 }
             }
         }
-
-        let frame_entry = self.insert_world_points(&accepted_world_points, origin);
+        let frame_entry = self.insert_frame_voxels(accepted_frame_voxels, origin);
         self.frame_index.push_back(frame_entry);
 
         self.pending_voxel_map.retain(|_, pending| {
@@ -1520,6 +1526,25 @@ pub fn voxel_key(p: &Point3<f32>, voxel_size: f32) -> VoxelKey {
     }
 }
 
+fn accumulate_frame_voxel(
+    frame_voxels: &mut FxHashMap<VoxelKey, (Vector3<f32>, usize)>,
+    point: Point3<f32>,
+    voxel_size: f32,
+) {
+    if !point.coords.iter().all(|value| value.is_finite()) {
+        return;
+    }
+
+    let key = voxel_key(&point, voxel_size);
+    frame_voxels
+        .entry(key)
+        .and_modify(|(sum, count)| {
+            *sum += point.coords;
+            *count += 1;
+        })
+        .or_insert((point.coords, 1));
+}
+
 impl VoxelCell {
     pub fn new() -> Self {
         Self {
@@ -1786,12 +1811,7 @@ mod tests {
             iy: 0,
             iz: 0,
         };
-        let mut cell = VoxelCell::from_key(
-            &key,
-            map.config.index_voxel_size,
-            Point3::origin(),
-            0,
-        );
+        let mut cell = VoxelCell::from_key(&key, map.config.index_voxel_size, Point3::origin(), 0);
         cell.sample_count = 5;
         cell.observed_frames = 5;
         cell.surface_status = SurfaceStatus::Planar;

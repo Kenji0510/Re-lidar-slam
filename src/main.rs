@@ -12,17 +12,17 @@ use re_lidar_slam::{
     types::{CurrentFrameInfo, FrameLog, FrameTiming, IMU, PointXYZ, SLAMMap},
     voxel_map::{
         LOCALMap, LocalMapConfig, SurfaceFilterConfig, SurfaceStatus, WorldMapUpdateFilterConfig,
-        build_voxel_map,
     },
-    voxelization::{voxel_downsample_points, voxel_downsample_points_dual},
+    voxelization::{voxel_downsample_points, voxel_downsample_points_and_maps_dual},
 };
 use std::{
     ffi::OsString,
     time::{Duration, Instant},
 };
 
-const DATASET_DIR: &str = "/mnt/nas/share/avia/08232026/01";
-const SAVE_ROOT_DIR: &str = "data/output/debug/08232026";
+// const DATASET_DIR: &str = "/mnt/nas/share/avia/08232026/01";
+const DATASET_DIR: &str = "/mnt/nas/share/airy96/06212026/park05";
+const SAVE_ROOT_DIR: &str = "data/output/debug/08292026";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LidarModel {
@@ -44,7 +44,7 @@ impl LidarModel {
     fn input_subdir(self) -> &'static str {
         match self {
             Self::Mid70 => "mid-70",
-            Self::Airy96 => "airy",
+            Self::Airy96 => "",
             Self::Avia => "avia",
         }
     }
@@ -134,8 +134,10 @@ const MID70_ORIGIN_IN_AIRY96_Z_M: f64 = -0.06;
 const DOWNSAMPLE_VOXEL_SIZE: f32 = 0.25; // m
 const LOCAL_MAP_VOXEL_SIZE: f32 = 0.25; // m
 const GLOBAL_MAP_VOXEL_SIZE: f32 = 0.05; // m
-
-const NEIGHBOR_RANGE: i32 = 0; // Unused when build_voxel_map(..., is_target=false)
+// このセンサー構成では、走行全体で 1 フレームあたり約 1800 個の GlobalMap
+// voxel が増える。入力フレーム数から最終容量を先に確保し、実行途中の巨大な
+// HashMap 再配置（数百 ms のスパイク）を避ける。
+const GLOBAL_MAP_EXPECTED_NEW_VOXELS_PER_FRAME: usize = 2048;
 
 const LOCAL_KNN_K: usize = 5;
 const GLOBAL_KNN_K: usize = 5;
@@ -279,8 +281,14 @@ fn main() -> Result<()> {
         max_frames: 50,
         max_distance: MAX_DIST_FOR_VOXEL_MAP,
     };
+    let expected_global_voxel_capacity = pcd_files
+        .len()
+        .saturating_mul(GLOBAL_MAP_EXPECTED_NEW_VOXELS_PER_FRAME);
     let mut slam_map = SLAMMap {
-        global_voxel_map: LOCALMap::new(global_map_config),
+        global_voxel_map: LOCALMap::with_voxel_capacity(
+            global_map_config,
+            expected_global_voxel_capacity,
+        ),
         local_voxel_map: LOCALMap::new(local_map_config),
     };
     let surface_filter_config = SurfaceFilterConfig {
@@ -391,13 +399,14 @@ fn main() -> Result<()> {
 
         // --- Downsample deskewed points ---
         let voxel_start = Instant::now();
-        let (downsampled_source_points_for_local, downsampled_source_points_for_global) =
-            voxel_downsample_points_dual(
-                &deskewed_points,
-                DOWNSAMPLE_VOXEL_SIZE,
-                GLOBAL_MAP_VOXEL_SIZE,
-            );
+        let (local_source, global_source) = voxel_downsample_points_and_maps_dual(
+            &deskewed_points,
+            DOWNSAMPLE_VOXEL_SIZE,
+            GLOBAL_MAP_VOXEL_SIZE,
+        );
         let voxel_end = voxel_start.elapsed();
+        let downsampled_source_points_for_local = local_source.points;
+        let downsampled_source_points_for_global = global_source.points;
         log::debug!(
             "Frame {i}: Downsampled {} points → {} points in {:.2?}",
             deskewed_points.len(),
@@ -406,23 +415,10 @@ fn main() -> Result<()> {
         );
         // --- Downsample deskewed points ---
 
-        // --- Build voxel map for source points ---
-        let build_map_start = Instant::now();
-        let source_voxel_map = build_voxel_map(
-            &downsampled_source_points_for_local,
-            DOWNSAMPLE_VOXEL_SIZE,
-            NEIGHBOR_RANGE,
-            false,
-        );
-        let source_voxel_map_for_global = build_voxel_map(
-            &downsampled_source_points_for_global,
-            GLOBAL_MAP_VOXEL_SIZE,
-            NEIGHBOR_RANGE,
-            false,
-        );
-        let build_map_end = build_map_start.elapsed();
-        log::debug!("Frame {i}: Built voxel map in {:.2?}", build_map_end);
-        // --- Build voxel map for source points ---
+        // The source voxel maps were populated while emitting the centroids.
+        let source_voxel_map = local_source.voxel_map;
+        let source_voxel_map_for_global = global_source.voxel_map;
+        let build_map_end = Duration::ZERO;
 
         // --- ICP (Point to Plane) ---
         // IMU 予測姿勢を初期値として (R, t) を取り出す
